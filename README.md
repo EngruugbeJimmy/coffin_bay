@@ -1,42 +1,48 @@
-# Coffin Bay Groundwater Intelligence — Rizin / DEA Coastline Edition
+# Coffin Bay Groundwater Intelligence — spatial well-count + DEA coastline build
 
-This build uses the supplied **Rizin/AOI boundary** as the study-area frame and integrates the official **Digital Earth Australia (DEA) Coastlines annual shoreline** service into the hydrogeographic workflow.
+This build addresses three important workflow issues:
 
-## Coastline workflow
-- The app requests the DEA `shorelines_annual` WFS using the Rizin AOI bounding box.
-- The returned annual shoreline is clipped to Rizin before it is shown on the map or used for measurements.
-- Default analysis year is **2024**. **2025** is available as an option but is explicitly treated as interim DEA Coastlines data.
-- Well-to-coast distance is calculated as the shortest/perpendicular distance from every well point to the clipped shoreline in **EPSG:28353 (GDA94 / MGA zone 53)**, giving metres.
-- The exported well data includes `coastline_year` and `distance_coast_method` so the distance provenance travels with the CSV.
+## 1. Well count vs observations
 
-DEA Coastlines annual shorelines represent the median / most representative shoreline position at approximately mean sea level for each year. The current DEA release covers 1988–2025. Geoscience Australia documents the WFS layer as `dea:shorelines_annual` and provides Python examples using the same WFS endpoint.
+The previous demo generator expanded 1,200 spatial wells across four annual observations, producing 4,800 observation rows. Those were not 4,800 unique wells.
 
-## Hydrogeographic controls
-- **Rizin** is the study-area boundary and is bundled as `rizin.geojson` plus a complete `rizin.shp` set.
-- **Coastal analysis datum = 0.0 m AHD** is shown as the conceptual hydraulic datum anchor.
-- **Lake Wangary = 3.0 m AHD** is shown as a surface-water anchor.
-- The synthetic well generator places wells inside Rizin in an inland-to-coast corridor. When the DEA shoreline is reachable, the proxy distance is replaced by the measured DEA shoreline distance and the synthetic groundwater target is regenerated from that actual distance.
+This build removes that expansion for demo mode: **one synthetic observation is assigned to each well point**, so the default is **1,200 wells = 1,200 observations** when a 1,200-point well layer is supplied.
 
-## Model workflow
-- Random Forest
-- Generalized Additive Model (GAM)
-- XGBoost
-- Long Short-Term Memory (LSTM)
+For uploaded temporal groundwater CSVs, the app keeps the distinction between:
+- **Wells** = unique `well_id`
+- **Observations** = number of rows
 
-Model Lab lets the user train/compare candidates and explicitly **Load as active model**. Downstream prediction layers follow the loaded model.
+So an uploaded 1,200-well time series can legitimately contain more than 1,200 observations.
 
-## Data and map interaction
-- Upload a real well CSV as the primary data source.
-- Optional DEMO mode is available for interface testing.
-- Piezometric map supports Lasso, Box and Point selection.
-- Selected wells can be exported directly to CSV.
-- The map displays the Rizin boundary, DEA coastline, Lake Wangary and the 0 m AHD coastal datum in a blue-green hydrogeographic interface.
+## 2. Synthetic wells can use actual well-point geometry
 
-## Coordinate note
-The bundled Rizin geometry is represented in **EPSG:28353** before conversion to WGS84 for web mapping. DEA Coastlines arrives through the official WFS workflow and is transformed into EPSG:28353 for metric clipping and distance calculations.
+The sidebar now accepts an optional well-point layer (`ZIP` containing a shapefile, `GeoJSON`, or `GPKG`). In demo mode the synthetic groundwater values are assigned to those actual point locations rather than creating a second set of artificial well locations.
 
-## Scientific note
-The coastal 0 m AHD and Lake Wangary 3 m AHD values are implemented as explicit conceptual controls for this research interface. They should be validated against authoritative surveyed / hydrometric observations before being used as calibrated model boundary conditions.
+When the supplied point layer contains 1,200 points inside the Rizin AOI, the demo produces 1,200 well points and 1,200 synthetic observations.
 
-## Provenance
-Digital Earth Australia Coastlines is a Geoscience Australia vector product. Current documentation identifies version 3.1.0, coverage through 2025, and a Creative Commons Attribution 4.0 licence.
+If no well-point layer is supplied, the app generates exactly 1,200 fallback points inside Rizin.
+
+## 3. DEA Coastlines controls the coast-distance calculation
+
+The app retrieves the selected **DEA Coastlines annual shoreline** from the official GeoServer WFS at runtime, clips the returned shoreline to the Rizin AOI, and calculates the shortest projected point-to-shoreline distance in metres using EPSG:28353.
+
+The DEA Coastlines annual shoreline represents the most representative shoreline position at approximately 0 m above mean sea level. The current DEA Coastlines release covers 1988–2025, with 2025 interim data.
+
+## 4. Piezometric-map extraction
+
+On the Piezometric map:
+- choose `Lasso`, `Box`, or `Point` selection;
+- select the well points in any map area;
+- export the selected wells and observations as CSV.
+
+The piezometric preview is now rendered as a **solid cell-based geographic surface overlay**, not hundreds of extra blue point markers. The blue dots you were seeing were generated by the previous grid-marker preview, not additional wells.
+
+## 5. Scenario Lab
+
+Scenario controls now use robust scalar conversion for DEM, rainfall, NDVI, distance-to-coast, ET and surface-water distance, avoiding the previous `TypeError` when an input value is missing, non-numeric or represented differently in a pandas row.
+
+## 6. Data source behaviour
+
+`Upload CSV` is now explicit. The app does not silently fall back to demo data while the interface says `Upload CSV`.
+
+Demo data is only used after explicitly selecting `Use demo data`.

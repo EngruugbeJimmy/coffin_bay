@@ -219,71 +219,126 @@ def point_inside_boundary(lon, lat):
 # Rizin boundary itself. DEM + coast distance are location-driven.
 # ============================================================
 @st.cache_data
+def make_data(n_wells=300, years=1, seed=42, well_points=None):
+    """Create clearly labelled synthetic groundwater time series.
 
-def make_data(n_wells=1200, years=4, seed=42):
+    Each horizon keeps roughly 1,200 synthetic observations while increasing
+    temporal coverage:
+      1 year  = seasonal behaviour (4 seasons × 300 wells)
+      3 years = recurring inter-annual variability (12 seasons × 100 wells)
+      10 years = long-term trend (40 seasons × 30 wells)
+
+    The same well geometry is repeated through time within a selected horizon,
+    which allows temporal models to see repeated observations rather than
+    treating every record as a new well.
+    """
     rng = np.random.default_rng(seed)
+    periods_per_year = 4
+    total_periods = years * periods_per_year
 
-    if AOI_POLY is not None:
+    if well_points is not None and len(well_points) > 0:
+        wp = well_points.copy()
+        if wp.crs is not None:
+            wp = wp.to_crs(4326)
+        wp = wp[wp.geometry.notna() & ~wp.geometry.is_empty].copy()
+        wp = wp[wp.geometry.geom_type.isin(["Point"])].copy()
+        if len(wp) > n_wells:
+            wp = wp.iloc[:n_wells].copy()
+        n_wells = len(wp)
+        lon0=wp.geometry.x.to_numpy(float)
+        lat0=wp.geometry.y.to_numpy(float)
+        minx,miny,maxx,maxy=(AOI_POLY.bounds if AOI_POLY is not None else
+                             (lon0.min(),lat0.min(),lon0.max(),lat0.max()))
+        transect_t=np.clip((lon0-minx)/max(1e-9,maxx-minx),0,1)
+    elif AOI_POLY is not None:
         minx,miny,maxx,maxy=AOI_POLY.bounds
-        # Sample from a broad west-east transect, then keep points inside Rizin.
         pts=[]
         tries=0
-        while len(pts)<n_wells and tries<200000:
+        while len(pts)<n_wells and tries<250000:
             tries+=1
-            # Prefer inland-to-coast progression with more points in the interior.
             t=rng.uniform(0,1)
             lon=minx+(maxx-minx)*t + rng.normal(0,(maxx-minx)*0.02)
             lat=miny+(maxy-miny)*(0.18+0.66*(1-t)) + rng.normal(0,(maxy-miny)*0.055)
-            if point_inside_boundary(lon,lat): pts.append((lon,lat,t))
-        if len(pts)<n_wells:
-            # fallback rejection sampling across the AOI
-            minx,miny,maxx,maxy=AOI_POLY.bounds
-            while len(pts)<n_wells:
-                lon=rng.uniform(minx,maxx); lat=rng.uniform(miny,maxy)
-                if point_inside_boundary(lon,lat):
-                    t=(lon-minx)/max(1e-9,(maxx-minx)); pts.append((lon,lat,t))
-        coords=np.array([(p[0],p[1],p[2]) for p in pts])
+            if point_inside_boundary(lon,lat):
+                pts.append((lon,lat,t))
+        while len(pts)<n_wells:
+            lon=rng.uniform(minx,maxx); lat=rng.uniform(miny,maxy)
+            if point_inside_boundary(lon,lat):
+                t=(lon-minx)/max(1e-9,(maxx-minx))
+                pts.append((lon,lat,t))
+        coords=np.array(pts)
         lon0,lat0,transect_t=coords[:,0],coords[:,1],coords[:,2]
     else:
-        lon0=135.08+rng.uniform(0,.63,n_wells); lat0=-34.75+rng.uniform(0,.42,n_wells); transect_t=(lon0-lon0.min())/(lon0.max()-lon0.min())
+        lon0=135.08+rng.uniform(0,.63,n_wells)
+        lat0=-34.75+rng.uniform(0,.42,n_wells)
+        transect_t=(lon0-lon0.min())/(lon0.max()-lon0.min())
 
-    # A location-based hydrogeologic ordering: larger t = more inland.
     coast_distance=np.clip(140 + 14500*transect_t + rng.normal(0,420,n_wells),25,16000)
     inlandness=np.clip(coast_distance/np.nanmax(coast_distance),0,1)
     dem0=np.clip(0.25 + 34*(inlandness**0.72) + rng.normal(0,0.9,n_wells),0.05,40)
-
-    gs=np.array(["Bridgewater Formation","Uley Formation","Wanilla Formation","Sleaford Complex","Hutchison Supergroup","Kiana Granite"])
+    gs=np.array(["Bridgewater Formation","Uley Formation","Wanilla Formation",
+                 "Sleaford Complex","Hutchison Supergroup","Kiana Granite"])
     geo0=rng.choice(gs,n_wells,p=[.38,.14,.12,.15,.09,.12])
-    gf0=pd.Series(geo0).map({"Bridgewater Formation":1.25,"Uley Formation":.8,"Wanilla Formation":.4,"Sleaford Complex":1.55,"Hutchison Supergroup":-.35,"Kiana Granite":1.0}).to_numpy()
+    gf0=pd.Series(geo0).map({
+        "Bridgewater Formation":1.25,"Uley Formation":.8,"Wanilla Formation":.4,
+        "Sleaford Complex":1.55,"Hutchison Supergroup":-.35,"Kiana Granite":1.0
+    }).to_numpy()
+    dist_lake=np.sqrt(
+        ((lon0-LAKE_WANGARY["longitude"])/0.0058)**2 +
+        ((lat0-LAKE_WANGARY["latitude"])/0.0048)**2
+    )*1000
 
-    # Location relative to Lake Wangary anchors a surface-water connection signal.
-    dist_lake=np.sqrt(((lon0-LAKE_WANGARY["longitude"])/0.0058)**2 + ((lat0-LAKE_WANGARY["latitude"])/0.0048)**2)*1000
+    season_defs=[("Summer",-0.25,0),("Autumn",0.03,1),("Winter",0.46,2),("Spring",0.20,3)]
     rows=[]
-    start_year=2026-years
+    start_year=2025-years+1
+
+    # Shared well-specific baseline means the temporal signal is a change around
+    # a stable hydrogeologic location, rather than independent random wells.
+    well_effect=rng.normal(0,0.34,n_wells)
+
     for i in range(n_wells):
-        for j,yr in enumerate(range(start_year,2026)):
-            seasonal=["Summer","Autumn","Winter","Spring"][(j+i)%4]
-            sf={"Summer":-.25,"Autumn":.03,"Winter":.46,"Spring":.20}[seasonal]
-            rain=np.clip(rng.normal(520,85)+18*np.sin(j),260,820)
-            et=np.clip(rng.normal(1050,120),700,1400)
-            nd=np.clip(rng.normal(.50,.11),.18,.84)
-            nda=np.clip(rng.normal(0,.08),-.25,.25)
-            sw=np.clip(dist_lake+rng.normal(0,260),30,11000)
+        for j in range(total_periods):
+            yr=start_year + j//periods_per_year
+            season,sf,season_idx=season_defs[j%periods_per_year]
+
+            # Recurring seasonal recharge/ET plus realistic inter-annual variability.
+            year_idx=yr-start_year
+            wet_year=95*np.sin(2*np.pi*year_idx/3.2) + rng.normal(0,42)
+            rain=np.clip(rng.normal(520+wet_year,70),220,900)
+            et=np.clip(rng.normal(1050-0.35*wet_year,105),700,1400)
+            nd=np.clip(rng.normal(.50 + .035*np.sin(2*np.pi*(j%4)/4),.10),.18,.84)
+            nda=np.clip(rng.normal(.04*np.sin(2*np.pi*(j%4)/4),.08),-.25,.25)
             pressure=rng.normal(1013,8)
+            sw=np.clip(dist_lake[i]+rng.normal(0,260),30,11000)
             dem=float(np.clip(dem0[i]+rng.normal(0,.08),.05,40))
             coast=float(coast_distance[i])
-            # Conceptual synthetic groundwater surface anchored to 0 m AHD near coast
-            # and 3 m AHD at Lake Wangary, with inland head rise controlled by relief.
+
             coastal_lift=0.55*(coast/10000.0)
             lake_influence=1.15*np.exp(-dist_lake[i]/4200.0)
-            trend=.08*j+.22*np.sin((j+i)*.7)
-            gw=(0.15 + 0.54*dem + coastal_lift + lake_influence*(LAKE_WANGARY["level_mAHD"]-0.8)
-                + 0.72*gf0[i] + .006*(rain-500) - .0022*(et-1000) + 1.20*nd + .62*nda
-                + .025*(pressure-1013) + sf + trend + rng.normal(0,.52))
-            # Keep groundwater conceptually above the 0m coastal datum; clamp only for demo stability.
-            gw=max(-0.15,gw)
-            rows.append([f"CB_{i+1:05d}",lon0[i],lat0[i],dem,coast,geo0[i],gf0[i],nd,nda,rain,et,sw,pressure,yr,seasonal,gw,dist_lake[i]])
-    return pd.DataFrame(rows,columns=["well_id","longitude","latitude","dem_m","distance_coast_m","geology","geology_factor","ndvi_mean","ndvi_anomaly","rainfall_mm","et_mm","surface_water_distance_m","pressure_hpa","year","season","groundwater_level_mAHD","distance_lake_wangary_m"])
+
+            # Long-horizon synthetic trend is intentionally modest and labelled
+            # as scenario data, not an observed climate/hydrologic trend.
+            trend=0.025*year_idx
+            cyclical=0.22*np.sin(2*np.pi*year_idx/3.0)
+            seasonal_wave=0.18*np.sin(2*np.pi*(j%4)/4)
+
+            gw=(0.15 + 0.54*dem + coastal_lift
+                + lake_influence*(LAKE_WANGARY["level_mAHD"]-0.8)
+                + 0.72*gf0[i] + .006*(rain-500) - .0022*(et-1000)
+                + 1.20*nd + .62*nda + .025*(pressure-1013)
+                + sf + seasonal_wave + trend + cyclical + well_effect[i]
+                + rng.normal(0,.36))
+            rows.append([
+                f"CB_{i+1:05d}",lon0[i],lat0[i],dem,coast,geo0[i],gf0[i],
+                nd,nda,rain,et,sw,pressure,yr,season,max(-.15,gw),dist_lake[i]
+            ])
+
+    return pd.DataFrame(rows,columns=[
+        "well_id","longitude","latitude","dem_m","distance_coast_m","geology",
+        "geology_factor","ndvi_mean","ndvi_anomaly","rainfall_mm","et_mm",
+        "surface_water_distance_m","pressure_hpa","year","season",
+        "groundwater_level_mAHD","distance_lake_wangary_m"
+    ])
 
 
 def normalise_columns(df):
@@ -446,18 +501,47 @@ def refresh_synthetic_target(data):
     return d
 
 
-def grid_surface(df,col,grid_n=40):
-    """Simple inverse-distance weighted map preview bounded by the Rizin extent."""
+def grid_surface(df,col,grid_n=34):
+    """Create a cell-based IDW surface for a solid geographic map overlay."""
     q=df[["longitude","latitude",col]].dropna().copy()
     if len(q)<6 or q[col].nunique()<2:return None
     minx,miny,maxx,maxy=AOI_POLY.bounds if AOI_POLY is not None else (q.longitude.min(),q.latitude.min(),q.longitude.max(),q.latitude.max())
-    gx=np.linspace(minx,maxx,grid_n); gy=np.linspace(miny,maxy,grid_n)
-    xx,yy=np.meshgrid(gx,gy); pxv=q.longitude.to_numpy(float); pyv=q.latitude.to_numpy(float); zv=q[col].to_numpy(float)
-    z=np.empty(xx.size,float)
-    for i,(a,b) in enumerate(zip(xx.ravel(),yy.ravel())):
-        dd=np.sqrt(((pxv-a)*np.cos(np.deg2rad((pyv+b)/2)))**2+(pyv-b)**2)+1e-9
-        w=1/(dd**2); z[i]=np.sum(w*zv)/np.sum(w)
-    return gx,gy,z.reshape(xx.shape)
+    xs=np.linspace(minx,maxx,grid_n+1); ys=np.linspace(miny,maxy,grid_n+1)
+    centers=[]; values=[]
+    pxv=q.longitude.to_numpy(float); pyv=q.latitude.to_numpy(float); zv=q[col].to_numpy(float)
+    for iy in range(grid_n):
+        for ix in range(grid_n):
+            a=(xs[ix]+xs[ix+1])/2; b=(ys[iy]+ys[iy+1])/2
+            dd=np.sqrt(((pxv-a)*np.cos(np.deg2rad((pyv+b)/2)))**2+(pyv-b)**2)+1e-9
+            w=1/(dd**2); values.append(float(np.sum(w*zv)/np.sum(w))); centers.append((ix,iy))
+    return xs,ys,np.asarray(values,float),centers
+
+def draw_surface(fig,df,col):
+    surf=grid_surface(df,col)
+    if surf is None:return
+    xs,ys,vals,cells=surf
+    features=[]; z=[]
+    # Clip cells visually by using only cells whose center falls in the AOI.
+    for v,(ix,iy) in zip(vals,cells):
+        cx=(xs[ix]+xs[ix+1])/2; cy=(ys[iy]+ys[iy+1])/2
+        if AOI_POLY is not None and not point_inside_boundary(cx,cy): continue
+        cell=Polygon([[xs[ix],ys[iy]],[xs[ix+1],ys[iy]],[xs[ix+1],ys[iy+1]],[xs[ix],ys[iy+1]]])
+        if AOI_POLY is not None:
+            cell=cell.intersection(AOI_POLY)
+        if cell.is_empty: continue
+        geoms=list(cell.geoms) if cell.geom_type=="MultiPolygon" else [cell]
+        for gg in geoms:
+            ring=[list(xy) for xy in gg.exterior.coords]
+            features.append({"id":str(len(features)),"type":"Feature","properties":{"z":float(v)},"geometry":{"type":"Polygon","coordinates":[ring]}})
+            z.append(float(v))
+    if not features:return
+    gj={"type":"FeatureCollection","features":features}
+    locations=[f["id"] for f in features]
+    if hasattr(go,"Choroplethmap"):
+        fig.add_trace(go.Choroplethmap(geojson=gj,locations=locations,z=z,featureidkey="id",colorscale=[[0,"#0b5963"],[.45,"#35b7aa"],[.72,"#9cd8c8"],[1,"#d0b45e"]],marker_line_width=0,opacity=.34,showscale=False,hoverinfo="skip",name="Piezometric surface"))
+    else:
+        fig.add_trace(go.Choroplethmapbox(geojson=gj,locations=locations,z=z,featureidkey="id",colorscale=[[0,"#0b5963"],[.45,"#35b7aa"],[.72,"#9cd8c8"],[1,"#d0b45e"]],marker_line_width=0,opacity=.34,showscale=False,hoverinfo="skip",name="Piezometric surface"))
+
 
 # ============================================================
 # MAP HELPERS
@@ -493,6 +577,7 @@ def make_map(df,value_col,title,height=710,center=None,zoom=9.2,show_anchors=Tru
     if hasattr(px,"scatter_map"):
         fig=px.scatter_map(df,lat="latitude",lon="longitude",color=value_col,hover_name="well_id",hover_data=hover_cols,color_continuous_scale=[[0,"#075a67"],[.48,"#37b9ae"],[1,"#d3b355"]],zoom=zoom,height=height,center=center,opacity=.90,size_max=11)
         fig.update_layout(map_style="open-street-map")
+        fig.update_traces(customdata=np.arange(len(df)))
         if show_coastline:add_coastline_trace(fig,coastline_gdf)
         add_boundary_trace(fig)
         if show_anchors:
@@ -503,20 +588,59 @@ def make_map(df,value_col,title,height=710,center=None,zoom=9.2,show_anchors=Tru
     else:
         fig=px.scatter_mapbox(df,lat="latitude",lon="longitude",color=value_col,hover_name="well_id",hover_data=hover_cols,color_continuous_scale=[[0,"#075a67"],[.48,"#37b9ae"],[1,"#d3b355"]],zoom=zoom,height=height,center=center,opacity=.90,size_max=11)
         fig.update_layout(mapbox_style="open-street-map")
+        fig.update_traces(customdata=np.arange(len(df)))
         if show_coastline:add_coastline_trace(fig,coastline_gdf)
         add_boundary_trace(fig)
     fig.update_layout(margin=dict(l=0,r=0,t=28,b=0),paper_bgcolor="rgba(0,0,0,0)",legend=dict(orientation="h",y=1.02,x=.01),coloraxis_colorbar=dict(title="m AHD"))
     return fig
 
 
-def draw_surface(fig,df,col):
-    surf=grid_surface(df,col)
-    if surf is None:return
-    lon,lat,zi=surf; slon,slat=np.meshgrid(lon,lat)
-    if hasattr(go,"Scattermap"):
-        fig.add_trace(go.Scattermap(lat=slat.ravel(),lon=slon.ravel(),mode="markers",marker=dict(size=8,opacity=.16,color=zi.ravel(),colorscale=[[0,"#075a67"],[.48,"#37b9ae"],[1,"#d3b355"]],showscale=False),hoverinfo="skip",name="Piezometric surface preview"))
-    else:
-        fig.add_trace(go.Scattermapbox(lat=slat.ravel(),lon=slon.ravel(),mode="markers",marker=dict(size=8,opacity=.16,color=zi.ravel(),colorscale=[[0,"#075a67"],[.48,"#37b9ae"],[1,"#d3b355"]],showscale=False),hoverinfo="skip",name="Piezometric surface preview"))
+def load_well_points_upload(uploaded_file):
+    """Read a point shapefile ZIP / GeoJSON / GeoPackage and return point geometries."""
+    if uploaded_file is None:
+        return None, None
+    name=str(getattr(uploaded_file,"name","uploaded" )).lower()
+    try:
+        if name.endswith(".zip"):
+            tmp=DATA_DIR/"_well_upload"
+            tmp.mkdir(exist_ok=True)
+            zpath=tmp/"wells.zip"
+            zpath.write_bytes(uploaded_file.getvalue())
+            with zipfile.ZipFile(zpath) as z:
+                z.extractall(tmp)
+            shp=next(tmp.rglob("*.shp"),None)
+            if shp is None:
+                return None,"ZIP does not contain a .shp file."
+            gdf=gpd.read_file(shp)
+        else:
+            tmp=DATA_DIR/"_well_upload_source"
+            tmp.mkdir(exist_ok=True)
+            ext=Path(name).suffix or ".geojson"
+            path=tmp/('wells'+ext)
+            path.write_bytes(uploaded_file.getvalue())
+            gdf=gpd.read_file(path)
+        if gdf.empty:
+            return None,"Well-point layer is empty."
+        gdf=gdf[gdf.geometry.notna() & ~gdf.geometry.is_empty].copy()
+        gdf=gdf[gdf.geometry.geom_type.isin(["Point"])].copy()
+        if gdf.empty:
+            return None,"The uploaded layer contains no Point geometries."
+        if gdf.crs is None:
+            # Only accept missing CRS when coordinates clearly look geographic.
+            if not gdf.geometry.x.between(-180,180).all() or not gdf.geometry.y.between(-90,90).all():
+                return None,"Well-point layer has no CRS and the coordinates are not clearly geographic. Define the CRS before uploading."
+            gdf=gdf.set_crs(4326)
+        else:
+            gdf=gdf.to_crs(4326)
+        if AOI_POLY is not None:
+            inside=gdf.geometry.apply(lambda q: AOI_POLY.contains(q) or AOI_POLY.touches(q))
+            gdf=gdf[inside].copy()
+        gdf=gdf.drop_duplicates(subset=["geometry"]).reset_index(drop=True)
+        if gdf.empty:
+            return None,"No uploaded well points fall inside the Rizin AOI."
+        return gdf, f"Loaded {len(gdf):,} well points from {getattr(uploaded_file,'name','upload')}."
+    except Exception as exc:
+        return None,f"Well-point layer could not be read: {exc}"
 
 # ============================================================
 # STATE / SIDEBAR
@@ -529,6 +653,9 @@ if "coastline" not in st.session_state: st.session_state.coastline=None
 if "coastline_status" not in st.session_state: st.session_state.coastline_status="Not loaded"
 if "coast_year" not in st.session_state: st.session_state.coast_year=2024
 if "loaded_coast_year" not in st.session_state: st.session_state.loaded_coast_year=None
+if "uploaded_well_points" not in st.session_state: st.session_state.uploaded_well_points=None
+if "well_points_status" not in st.session_state: st.session_state.well_points_status="No well-point layer uploaded."
+if "spatial_selection_ids" not in st.session_state: st.session_state.spatial_selection_ids=[]
 
 with st.sidebar:
     st.markdown("# CB / HYDRO")
@@ -548,9 +675,47 @@ with st.sidebar:
             except Exception as exc: st.error(f"CSV could not be read: {exc}")
     else:
         st.session_state.dataset="Use demo data"
-        st.caption("Optional demonstration dataset for interface testing only.")
+        st.markdown("### Synthetic time horizon")
+        synthetic_horizon=st.selectbox(
+            "Synthetic modelling horizon",
+            ["1 year · seasonal","3 years · recurring variability","10 years · long-term trend"],
+            index=0,
+            help="1 year emphasises seasonal structure; 3 years adds recurring inter-annual variability; 10 years provides a longer synthetic series for trend-modelling demonstrations."
+        )
+        horizon_years={"1 year · seasonal":1,"3 years · recurring variability":3,"10 years · long-term trend":10}[synthetic_horizon]
+        st.session_state["synthetic_horizon_label"]=synthetic_horizon
+        st.session_state["synthetic_years"]=horizon_years
+        st.caption("Synthetic data are scenario data, not observed measurements. Each option keeps approximately 1,200 records while changing temporal coverage.")
+    st.markdown("### Well-point geometry")
+    wp_upload=st.file_uploader("Upload well-point layer (ZIP SHP / GeoJSON)",type=["zip","geojson","json","gpkg"],help="For the demo, supplied points anchor the synthetic wells. The selected horizon repeats each well through time so temporal models can learn seasonal, recurring, or long-term patterns.")
+    if wp_upload is not None and st.session_state.get("well_points_filename") != getattr(wp_upload,"name",""):
+        wp,status=load_well_points_upload(wp_upload)
+        st.session_state.uploaded_well_points=wp
+        st.session_state.well_points_status=status
+        st.session_state.well_points_filename=getattr(wp_upload,"name","")
+        st.session_state.models_loaded=False
+        st.session_state.active_model=None
+    if st.session_state.uploaded_well_points is not None:
+        st.caption(st.session_state.well_points_status)
+        if len(st.session_state.uploaded_well_points) != 1200:
+            st.warning(f"Well-point layer contains {len(st.session_state.uploaded_well_points):,} points. The demo will use that point count.")
 
-base=st.session_state.uploaded_df if st.session_state.dataset=="Upload CSV" and st.session_state.uploaded_df is not None else make_data()
+well_points = st.session_state.uploaded_well_points if st.session_state.dataset=="Use demo data" else None
+if st.session_state.dataset=="Upload CSV" and st.session_state.uploaded_df is None:
+    st.markdown('<div class="hero"><div class="hero-title">CB / Groundwater Intelligence</div><div class="hero-sub">Upload the groundwater observation CSV to activate the analysis workspace.</div><span class="chip">DATA · WAITING FOR UPLOAD</span></div>',unsafe_allow_html=True)
+    st.info("No groundwater observations are loaded yet. Use the sidebar upload control, or switch the data source to Use demo data.")
+    st.stop()
+if st.session_state.dataset=="Upload CSV":
+    # Uploaded observations always remain authoritative; synthetic horizon controls
+    # are only used in the demo-data mode.
+    base=st.session_state.uploaded_df
+else:
+    horizon_years=st.session_state.get("synthetic_years",1)
+    # Keep roughly 1,200 records per synthetic horizon.
+    n_synth_wells=max(30,int(round(1200/(4*horizon_years))))
+    if well_points is not None:
+        n_synth_wells=min(n_synth_wells,len(well_points))
+    base=make_data(n_wells=n_synth_wells,years=horizon_years,well_points=well_points)
 if "geology_factor" not in base.columns: base=base.copy(); base["geology_factor"]=0.0
 for c in FEATURE_CANDIDATES:
     if c not in base.columns: base[c]=np.nan
@@ -564,7 +729,8 @@ with st.sidebar:
     st.markdown("### Modelling")
     if view=="Model lab":
         st.caption("Choose models on this page, train them, then load one as the active layer.")
-    selected=st.multiselect("Models to train / compare",available_models,default=available_models)
+    default_models=[m for m in available_models if m!="LSTM"] if st.session_state.dataset=="Use demo data" else available_models
+    selected=st.multiselect("Models to train / compare",available_models,default=default_models)
     st.markdown("### Coastline reference")
     coast_year=st.selectbox("DEA annual shoreline",list(range(1988,2026)),index=list(range(1988,2026)).index(st.session_state.get("coast_year",2024)))
     st.session_state["coast_year"]=int(coast_year)
@@ -622,14 +788,18 @@ d=res[res.geology.astype(str).isin(geos) & res.season.astype(str).isin(seasons) 
 data_label = "UPLOAD" if st.session_state.dataset=="Upload CSV" else "DEMO"
 active_label = active.upper().replace(" ", " · ") if active else "NOT LOADED"
 status_chip = f"DATA · {data_label} &nbsp;|&nbsp; ACTIVE MODEL · {active.upper()}" if active else f"DATA · {data_label} &nbsp;|&nbsp; MODEL · NOT LOADED"
-st.markdown(f'<div class="hero"><div class="hero-title">CB / Groundwater Intelligence</div><div class="hero-sub">Physical-geography workspace · Rizin study boundary · piezometric controls · spatial extraction · multi-model comparison</div><span class="chip">{status_chip}</span></div>',unsafe_allow_html=True)
+st.markdown(f'<div class="hero"><div class="hero-title">CB / Groundwater Intelligence</div><div class="hero-sub">Physical-geography workspace · Rizin AOI · DEA shoreline distance · surface-water anchors · spatial extraction</div><span class="chip">{status_chip}</span></div>',unsafe_allow_html=True)
 
 # ============================================================
 # PAGES
 # ============================================================
 if view=="Overview":
     st.markdown('<div class="section">Hydrologic context</div>',unsafe_allow_html=True)
-    a,b,c,e=st.columns(4); a.metric("Wells / observations",f"{len(d):,}"); b.metric("Study boundary","Rizin"); c.metric("DEA coastline",str(st.session_state.get("coast_year")) if coastline_gdf is not None else "Unavailable"); e.metric("Lake Wangary",f"{lake_level:.1f} m AHD" if lake_selected else "Off")
+    a,b,c,e=st.columns(4); a.metric("Wells",f"{d.well_id.nunique():,}"); b.metric("Observations",f"{len(d):,}"); c.metric("DEA coastline",str(st.session_state.get("coast_year")) if coastline_gdf is not None else "Unavailable"); e.metric("Lake Wangary",f"{lake_level:.1f} m AHD" if lake_selected else "Off")
+    if st.session_state.dataset=="Use demo data":
+        st.caption(f"Synthetic horizon: {st.session_state.get('synthetic_horizon_label','1 year · seasonal')} · {d.well_id.nunique():,} repeated wells · {len(d):,} synthetic observations. Use the horizon toggle in the sidebar to change temporal coverage.")
+    elif d.well_id.nunique()!=len(d):
+        st.caption(f"Uploaded temporal dataset: {d.well_id.nunique():,} unique wells across {len(d):,} observations.")
     if coastline_gdf is not None:
         st.markdown(f'<div class="hydro-good"><b>Distance-to-coast engine:</b> shortest perpendicular distance from each well to the clipped DEA annual shoreline for <b>{st.session_state.get("coast_year")}</b>, calculated in EPSG:28353 metres.</div>',unsafe_allow_html=True)
     else:
@@ -657,16 +827,26 @@ elif view=="Piezometric map":
     ids=[]
     try:
         for pt in event.selection.points:
-            curve=pt.get("curve_number",pt.get("curveNumber",0)); idx=pt.get("point_index",pt.get("pointNumber",None))
-            if curve==0 and idx is not None: ids.append(int(idx))
+            cd=pt.get("customdata")
+            if isinstance(cd,(list,tuple,np.ndarray)) and len(cd):
+                ids.append(int(cd[0]))
+            elif cd is not None and np.isscalar(cd):
+                ids.append(int(cd))
+            else:
+                idx=pt.get("point_index",pt.get("pointNumber",None))
+                curve=pt.get("curve_number",pt.get("curveNumber",None))
+                if idx is not None and curve in (0,None): ids.append(int(idx))
     except Exception: pass
     ids=sorted(set(i for i in ids if 0<=i<len(d)))
+    if ids: st.session_state.spatial_selection_ids=ids
+    elif event.selection is not None and len(event.selection.points)==0: st.session_state.spatial_selection_ids=[]
+    ids=st.session_state.get("spatial_selection_ids",[])
     selected_rows=d.iloc[ids].copy() if ids else d.iloc[0:0].copy()
-    st.markdown('<div class="panel"><b>Spatial extraction</b><div class="small">Draw a lasso or box over any part of the Coffin Bay region to extract the enclosed well observations. Point mode is useful for one-well inspection.</div></div>',unsafe_allow_html=True)
-    a,b=st.columns([1,2]); a.metric("Selected observations",f"{len(selected_rows):,}")
+    st.markdown('<div class="panel"><b>Spatial extraction</b><div class="small">Draw a lasso or box over the map to extract the well points contained by the selected area. The preview surface is a continuous cell overlay; blue dots are not synthetic wells.</div></div>',unsafe_allow_html=True)
+    a,b=st.columns([1,2]); a.metric("Selected wells",f"{len(selected_rows):,}")
     if len(selected_rows):
         b.download_button("Export selected wells · CSV",selected_rows.to_csv(index=False).encode(),"coffin_bay_selected_wells.csv","text/csv",use_container_width=True); st.dataframe(selected_rows,use_container_width=True,hide_index=True)
-    else: st.caption("No spatial selection yet.")
+    else: st.caption("No spatial selection yet. Use Lasso, Box or Point above the map.")
 
 elif view=="Model lab":
     st.markdown('<div class="section">Model training & active-model selection</div>',unsafe_allow_html=True)
@@ -733,7 +913,20 @@ elif view=="Scenario lab":
         st.info("Load an active model from Model Lab first.")
         st.stop()
     st.markdown('<div class="hydro-note">Scenarios are conceptual. The controls make the coastal and Lake Wangary anchors explicit so scenario changes are visible relative to a physical datum framework.</div>',unsafe_allow_html=True)
-    rr=res.iloc[0].copy(); c1,c2,c3=st.columns(3); dem=c1.slider("DEM (m)",0.,40.,float(np.clip(rr.dem_m,0,40)),.5); rain=c2.slider("Rainfall (mm)",250,820,int(rr.rainfall_mm),10); nd=c3.slider("NDVI",.1,.95,float(rr.ndvi_mean),.01); coast=c1.slider("Distance to coast (m)",20,16000,int(np.clip(rr.distance_coast_m,20,16000)),100); et=c2.slider("ET (mm)",700,1400,int(rr.et_mm),10); sw=c3.slider("Surface-water distance (m)",20,11000,int(rr.surface_water_distance_m),100)
+    rr=res.iloc[0].copy()
+    def sval(obj,key,default):
+        try:
+            v=pd.to_numeric(obj.get(key,default),errors="coerce")
+            return float(v) if pd.notna(v) else float(default)
+        except Exception:
+            return float(default)
+    c1,c2,c3=st.columns(3)
+    dem=c1.slider("DEM (m)",0.,40.,float(np.clip(sval(rr,"dem_m",10),0,40)),.5)
+    rain=c2.slider("Rainfall (mm)",250,820,int(np.clip(sval(rr,"rainfall_mm",520),250,820)),10)
+    nd=c3.slider("NDVI",.1,.95,float(np.clip(sval(rr,"ndvi_mean",.5),.1,.95)),.01)
+    coast=c1.slider("Distance to coast (m)",20,16000,int(np.clip(sval(rr,"distance_coast_m",1000),20,16000)),100)
+    et=c2.slider("ET (mm)",700,1400,int(np.clip(sval(rr,"et_mm",1050),700,1400)),10)
+    sw=c3.slider("Surface-water distance (m)",20,11000,int(np.clip(sval(rr,"surface_water_distance_m",6000),20,11000)),100)
     row=rr.copy(); row.update({"dem_m":dem,"rainfall_mm":rain,"ndvi_mean":nd,"distance_coast_m":coast,"et_mm":et,"surface_water_distance_m":sw}); Xrow=pd.DataFrame([{q:(row[q] if pd.notna(row[q]) else res[q].median()) for q in f}]); mdl=models.get(active)
     if active!="LSTM": pred=float(mdl.predict(Xrow)[0]); st.metric("Scenario prediction",f"{pred:.2f} m AHD")
     else: st.info("The LSTM is sequence-based; use Well explorer or Model lab for temporal predictions and benchmark results.")
@@ -741,12 +934,12 @@ elif view=="Scenario lab":
 else:
     st.markdown('<div class="section">Data, spatial selection & export</div>',unsafe_allow_html=True)
     st.markdown('<div class="panel">The recommended extraction workflow is <b>Piezometric map → Lasso / Box → Export selected wells</b>. The current filters can also be exported here.</div>',unsafe_allow_html=True)
-    a,b,c=st.columns(3); a.metric("Filtered observations",f"{len(d):,}"); b.metric("Longitude span",f"{d.longitude.max()-d.longitude.min():.3f}°" if len(d) else "—"); c.metric("Latitude span",f"{d.latitude.max()-d.latitude.min():.3f}°" if len(d) else "—")
+    a,b,c=st.columns(3); a.metric("Wells",f"{d.well_id.nunique():,}"); b.metric("Observations",f"{len(d):,}"); c.metric("Coast distance",("DEA shoreline" if coastline_gdf is not None else "Unavailable"))
     st.download_button("Export current filtered dataset · CSV",d.to_csv(index=False).encode(),"coffin_bay_filtered_wells.csv","text/csv",use_container_width=True); st.dataframe(d.head(700),use_container_width=True,hide_index=True)
     st.markdown('<div class="hydro-good">Study-area boundary: <b>Rizin</b>. The supplied geometry is bundled into this build as <code>rizin.geojson</code> plus a complete <code>rizin.shp</code> set so the app can display and validate the boundary reliably.</div>',unsafe_allow_html=True)
 
 st.markdown("---")
 if st.session_state.dataset=="Use demo data":
-    st.caption("Research prototype · Demo data mode is for interface and workflow testing only.")
+    st.caption(f"Demo synthetic mode · {st.session_state.get('synthetic_horizon_label','1 year · seasonal')} · scenario data for temporal modelling. Upload CSV observations at any time to retain and analyse real/read data instead.")
 else:
     st.caption(f"Research workspace · Rizin AOI + DEA Coastlines {st.session_state.get('coast_year','—')} + hydrologic anchors + spatial well extraction + RF / GAM / XGBoost / LSTM model comparison on the uploaded dataset.")
