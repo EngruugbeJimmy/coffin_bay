@@ -1,43 +1,42 @@
-# Coffin Bay Groundwater Intelligence — Multi-Model Interactive Edition
+# Coffin Bay Groundwater Intelligence — Rizin / DEA Coastline Edition
 
-A Streamlit research prototype designed as a light coastal / physical-geography map interface. It supports spatial selection and CSV extraction, plus model training and comparison across **Random Forest, Generalized Additive Model (GAM), XGBoost and Long Short-Term Memory (LSTM)**.
+This build uses the supplied **Rizin/AOI boundary** as the study-area frame and integrates the official **Digital Earth Australia (DEA) Coastlines annual shoreline** service into the hydrogeographic workflow.
 
-## Run
-```bash
-pip install -r requirements.txt
-streamlit run app.py
-```
+## Coastline workflow
+- The app requests the DEA `shorelines_annual` WFS using the Rizin AOI bounding box.
+- The returned annual shoreline is clipped to Rizin before it is shown on the map or used for measurements.
+- Default analysis year is **2024**. **2025** is available as an option but is explicitly treated as interim DEA Coastlines data.
+- Well-to-coast distance is calculated as the shortest/perpendicular distance from every well point to the clipped shoreline in **EPSG:28353 (GDA94 / MGA zone 53)**, giving metres.
+- The exported well data includes `coastline_year` and `distance_coast_method` so the distance provenance travels with the CSV.
 
-## Main capabilities
-- Green-blue coastal UI instead of a black AI-style dashboard.
-- **Piezometric map** as the primary interactive workspace.
-- Lasso, box and point selection of map observations.
-- Export selected wells / observations to CSV.
-- Upload a groundwater observation CSV and normalise common column names.
-- Train and compare **Random Forest, GAM, XGBoost and LSTM** from the sidebar.
-- Select an **Active prediction layer** and use it throughout the map, diagnostics, drivers and well explorer.
-- **Model Lab** ranks successful models by holdout RMSE, then reports the leading predictive feature for the champion model.
-- Feature diagnostics use native tree importance, permutation importance for GAM and a sequence-permutation diagnostic for LSTM.
-- Synthetic demonstration data contain repeated annual observations for each synthetic well so the LSTM has a temporal sequence to learn.
+DEA Coastlines annual shorelines represent the median / most representative shoreline position at approximately mean sea level for each year. The current DEA release covers 1988–2025. Geoscience Australia documents the WFS layer as `dea:shorelines_annual` and provides Python examples using the same WFS endpoint.
 
-## Model-selection logic
-All selected models are trained against the same groundwater target. The leaderboard prioritises **lowest holdout RMSE**, with MAE and R² shown alongside it. The top feature is the highest model-specific importance score.
+## Hydrogeographic controls
+- **Rizin** is the study-area boundary and is bundled as `rizin.geojson` plus a complete `rizin.shp` set.
+- **Coastal analysis datum = 0.0 m AHD** is shown as the conceptual hydraulic datum anchor.
+- **Lake Wangary = 3.0 m AHD** is shown as a surface-water anchor.
+- The synthetic well generator places wells inside Rizin in an inland-to-coast corridor. When the DEA shoreline is reachable, the proxy distance is replaced by the measured DEA shoreline distance and the synthetic groundwater target is regenerated from that actual distance.
 
-This is an exploratory benchmark on synthetic data. The champion model and feature should not be presented as a validated real-world Coffin Bay result.
+## Model workflow
+- Random Forest
+- Generalized Additive Model (GAM)
+- XGBoost
+- Long Short-Term Memory (LSTM)
 
-## Notes for uploaded observational data
-For GAM / RF / XGBoost, a single observation per well can still be used. LSTM requires repeated observations with `well_id` and `year` (or an equivalent temporal field). If the uploaded dataset has too few repeated wells, the LSTM entry reports a clear error rather than silently producing an invalid result.
+Model Lab lets the user train/compare candidates and explicitly **Load as active model**. Downstream prediction layers follow the loaded model.
 
-Recommended columns:
-- `well_id` (optional for non-LSTM models; required for temporal LSTM sequences)
-- `longitude` / `lon`
-- `latitude` / `lat`
-- `groundwater_level_mAHD` / `water_level`
-- `year` / `date_year`
-- `dem_m` / `dem` / `elevation`
-- `distance_coast_m` / `coast_distance_m`
-- `geology` / `formation`
-- optional rainfall, ET, NDVI, pressure and surface-water-distance predictors
+## Data and map interaction
+- Upload a real well CSV as the primary data source.
+- Optional DEMO mode is available for interface testing.
+- Piezometric map supports Lasso, Box and Point selection.
+- Selected wells can be exported directly to CSV.
+- The map displays the Rizin boundary, DEA coastline, Lake Wangary and the 0 m AHD coastal datum in a blue-green hydrogeographic interface.
 
-## Scientific caution
-The included data are synthetic and intended for interface and workflow prototyping only. Replace them with validated Coffin Bay observations and an appropriately documented modelling / interpolation workflow before scientific inference.
+## Coordinate note
+The bundled Rizin geometry is represented in **EPSG:28353** before conversion to WGS84 for web mapping. DEA Coastlines arrives through the official WFS workflow and is transformed into EPSG:28353 for metric clipping and distance calculations.
+
+## Scientific note
+The coastal 0 m AHD and Lake Wangary 3 m AHD values are implemented as explicit conceptual controls for this research interface. They should be validated against authoritative surveyed / hydrometric observations before being used as calibrated model boundary conditions.
+
+## Provenance
+Digital Earth Australia Coastlines is a Geoscience Australia vector product. Current documentation identifies version 3.1.0, coverage through 2025, and a Creative Commons Attribution 4.0 licence.
