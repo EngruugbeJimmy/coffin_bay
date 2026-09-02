@@ -219,54 +219,45 @@ def point_inside_boundary(lon, lat):
 # Rizin boundary itself. DEM + coast distance are location-driven.
 # ============================================================
 @st.cache_data
-def make_data(n_wells=300, years=1, seed=42, well_points=None):
-    """Create clearly labelled synthetic groundwater time series.
+def make_data(n_wells=1200, years=5, seed=42, well_points=None):
+    """Create a five-year monthly synthetic groundwater time series.
 
-    Each horizon keeps roughly 1,200 synthetic observations while increasing
-    temporal coverage:
-      1 year  = seasonal behaviour (4 seasons × 300 wells)
-      3 years = recurring inter-annual variability (12 seasons × 100 wells)
-      10 years = long-term trend (40 seasons × 30 wells)
-
-    The same well geometry is repeated through time within a selected horizon,
-    which allows temporal models to see repeated observations rather than
-    treating every record as a new well.
+    Demo mode represents 1,200 fixed well locations inside the Rizin/Coffin Bay AOI
+    and repeats each location for 60 monthly observations (5 years = 72,000 rows).
+    The synthetic target is explicitly scenario data: useful for exercising spatial,
+    seasonal, recurring-variability and trend-modelling workflows, not observations.
     """
     rng = np.random.default_rng(seed)
-    periods_per_year = 4
-    total_periods = years * periods_per_year
+    months_per_year = 12
+    total_months = int(years * months_per_year)
 
     if well_points is not None and len(well_points) > 0:
         wp = well_points.copy()
         if wp.crs is not None:
             wp = wp.to_crs(4326)
         wp = wp[wp.geometry.notna() & ~wp.geometry.is_empty].copy()
-        wp = wp[wp.geometry.geom_type.isin(["Point"])].copy()
+        wp = wp[wp.geometry.geom_type.eq("Point")].copy()
+        if AOI_POLY is not None:
+            wp = wp[wp.geometry.apply(lambda q: AOI_POLY.contains(q) or AOI_POLY.touches(q))].copy()
+        wp = wp.drop_duplicates(subset=["geometry"]).reset_index(drop=True)
         if len(wp) > n_wells:
             wp = wp.iloc[:n_wells].copy()
         n_wells = len(wp)
-        lon0=wp.geometry.x.to_numpy(float)
-        lat0=wp.geometry.y.to_numpy(float)
-        minx,miny,maxx,maxy=(AOI_POLY.bounds if AOI_POLY is not None else
-                             (lon0.min(),lat0.min(),lon0.max(),lat0.max()))
-        transect_t=np.clip((lon0-minx)/max(1e-9,maxx-minx),0,1)
+        lon0 = wp.geometry.x.to_numpy(float)
+        lat0 = wp.geometry.y.to_numpy(float)
+        minx,miny,maxx,maxy = AOI_POLY.bounds if AOI_POLY is not None else (lon0.min(),lat0.min(),lon0.max(),lat0.max())
+        transect_t = np.clip((lon0-minx)/max(1e-9,maxx-minx),0,1)
     elif AOI_POLY is not None:
+        # Deterministic spatial sample: exactly 1,200 points inside the AOI by default.
         minx,miny,maxx,maxy=AOI_POLY.bounds
-        pts=[]
-        tries=0
-        while len(pts)<n_wells and tries<250000:
-            tries+=1
-            t=rng.uniform(0,1)
-            lon=minx+(maxx-minx)*t + rng.normal(0,(maxx-minx)*0.02)
-            lat=miny+(maxy-miny)*(0.18+0.66*(1-t)) + rng.normal(0,(maxy-miny)*0.055)
-            if point_inside_boundary(lon,lat):
-                pts.append((lon,lat,t))
-        while len(pts)<n_wells:
+        pts=[]; tries=0
+        while len(pts)<n_wells and tries<400000:
+            tries += 1
             lon=rng.uniform(minx,maxx); lat=rng.uniform(miny,maxy)
             if point_inside_boundary(lon,lat):
-                t=(lon-minx)/max(1e-9,(maxx-minx))
+                t=(lon-minx)/max(1e-9,maxx-minx)
                 pts.append((lon,lat,t))
-        coords=np.array(pts)
+        coords=np.asarray(pts)
         lon0,lat0,transect_t=coords[:,0],coords[:,1],coords[:,2]
     else:
         lon0=135.08+rng.uniform(0,.63,n_wells)
@@ -288,56 +279,51 @@ def make_data(n_wells=300, years=1, seed=42, well_points=None):
         ((lat0-LAKE_WANGARY["latitude"])/0.0048)**2
     )*1000
 
-    season_defs=[("Summer",-0.25,0),("Autumn",0.03,1),("Winter",0.46,2),("Spring",0.20,3)]
+    # Five complete calendar years: 2021-01 through 2025-12.
+    dates=pd.date_range("2021-01-01",periods=total_months,freq="MS")
     rows=[]
-    start_year=2025-years+1
-
-    # Shared well-specific baseline means the temporal signal is a change around
-    # a stable hydrogeologic location, rather than independent random wells.
     well_effect=rng.normal(0,0.34,n_wells)
+    season_map={12:"Summer",1:"Summer",2:"Summer",3:"Autumn",4:"Autumn",5:"Autumn",
+                6:"Winter",7:"Winter",8:"Winter",9:"Spring",10:"Spring",11:"Spring"}
+    season_factor={"Summer":-.25,"Autumn":.03,"Winter":.46,"Spring":.20}
 
     for i in range(n_wells):
-        for j in range(total_periods):
-            yr=start_year + j//periods_per_year
-            season,sf,season_idx=season_defs[j%periods_per_year]
-
-            # Recurring seasonal recharge/ET plus realistic inter-annual variability.
-            year_idx=yr-start_year
-            wet_year=95*np.sin(2*np.pi*year_idx/3.2) + rng.normal(0,42)
-            rain=np.clip(rng.normal(520+wet_year,70),220,900)
-            et=np.clip(rng.normal(1050-0.35*wet_year,105),700,1400)
-            nd=np.clip(rng.normal(.50 + .035*np.sin(2*np.pi*(j%4)/4),.10),.18,.84)
-            nda=np.clip(rng.normal(.04*np.sin(2*np.pi*(j%4)/4),.08),-.25,.25)
-            pressure=rng.normal(1013,8)
+        for j,dt in enumerate(dates):
+            yr=int(dt.year); month=int(dt.month); year_idx=yr-dates[0].year
+            season=season_map[month]
+            # Smooth annual cycle plus inter-annual variability and a modest trend.
+            phase=2*np.pi*(month-1)/12
+            wet_cycle=95*np.sin(2*np.pi*year_idx/3.2)
+            rain=np.clip(rng.normal(520 + wet_cycle + 85*np.sin(phase-np.pi/2),55),220,900)
+            et=np.clip(rng.normal(1050 - 0.30*wet_cycle + 105*np.sin(phase),65),700,1400)
+            nd=np.clip(rng.normal(.50 + .055*np.sin(phase+0.7),.07),.18,.84)
+            nda=np.clip(rng.normal(.06*np.sin(phase),.055),-.25,.25)
+            pressure=rng.normal(1013,7)
             sw=np.clip(dist_lake[i]+rng.normal(0,260),30,11000)
             dem=float(np.clip(dem0[i]+rng.normal(0,.08),.05,40))
             coast=float(coast_distance[i])
-
             coastal_lift=0.55*(coast/10000.0)
             lake_influence=1.15*np.exp(-dist_lake[i]/4200.0)
-
-            # Long-horizon synthetic trend is intentionally modest and labelled
-            # as scenario data, not an observed climate/hydrologic trend.
-            trend=0.025*year_idx
+            trend=0.028*year_idx
             cyclical=0.22*np.sin(2*np.pi*year_idx/3.0)
-            seasonal_wave=0.18*np.sin(2*np.pi*(j%4)/4)
-
+            seasonal_wave=0.20*np.sin(phase)
             gw=(0.15 + 0.54*dem + coastal_lift
                 + lake_influence*(LAKE_WANGARY["level_mAHD"]-0.8)
                 + 0.72*gf0[i] + .006*(rain-500) - .0022*(et-1000)
                 + 1.20*nd + .62*nda + .025*(pressure-1013)
-                + sf + seasonal_wave + trend + cyclical + well_effect[i]
-                + rng.normal(0,.36))
+                + season_factor[season] + seasonal_wave + trend + cyclical
+                + well_effect[i] + rng.normal(0,.30))
             rows.append([
                 f"CB_{i+1:05d}",lon0[i],lat0[i],dem,coast,geo0[i],gf0[i],
-                nd,nda,rain,et,sw,pressure,yr,season,max(-.15,gw),dist_lake[i]
+                nd,nda,rain,et,sw,pressure,yr,month,dt,season,
+                max(-.15,gw),dist_lake[i],j
             ])
 
     return pd.DataFrame(rows,columns=[
         "well_id","longitude","latitude","dem_m","distance_coast_m","geology",
         "geology_factor","ndvi_mean","ndvi_anomaly","rainfall_mm","et_mm",
-        "surface_water_distance_m","pressure_hpa","year","season",
-        "groundwater_level_mAHD","distance_lake_wangary_m"
+        "surface_water_distance_m","pressure_hpa","year","month","date","season",
+        "groundwater_level_mAHD","distance_lake_wangary_m","time_index"
     ])
 
 
@@ -347,22 +333,42 @@ def normalise_columns(df):
         "well_id":["well_id","well","site","id","bore_id"],"longitude":["longitude","lon","x_lon"],"latitude":["latitude","lat","y_lat"],
         "groundwater_level_mAHD":["groundwater_level_mAHD","groundwater_level","water_level","gw_level","head_mAHD"],
         "dem_m":["dem_m","dem","elevation","elev_m"],"distance_coast_m":["distance_coast_m","coast_distance_m","distance_to_coast_m"],
-        "geology":["geology","formation","lithology"],"season":["season"],"year":["year","date_year"]}
+        "geology":["geology","formation","lithology"],"season":["season"],"year":["year","date_year"],"month":["month","month_num"],"date":["date","datetime","timestamp","observation_date"]}
     lower={str(c).strip().lower():c for c in d.columns}
     for target,names in aliases.items():
         if target not in d.columns:
             found=next((lower.get(n) for n in names if n in lower),None)
             if found is not None:d[target]=d[found]
     if "well_id" not in d.columns:d["well_id"]= [f"CB_{i:05d}" for i in range(1,len(d)+1)]
-    for c,default in [("dem_m",np.nan),("distance_coast_m",np.nan),("geology","Unknown"),("season","Unknown"),("year",2025)]:
+    for c,default in [("dem_m",np.nan),("distance_coast_m",np.nan),("geology","Unknown"),("season","Unknown"),("year",2025),("month",1)]:
         if c not in d.columns:d[c]=default
-    for c in ["longitude","latitude","groundwater_level_mAHD","dem_m","distance_coast_m","year"]:
+    for c in ["longitude","latitude","groundwater_level_mAHD","dem_m","distance_coast_m","year","month"]:
         if c in d:d[c]=pd.to_numeric(d[c],errors="coerce")
     d=d.dropna(subset=["longitude","latitude","groundwater_level_mAHD"]).reset_index(drop=True)
-    d["geology"]=d["geology"].fillna("Unknown").astype(str); d["season"]=d["season"].fillna("Unknown").astype(str)
+    d["geology"]=d["geology"].fillna("Unknown").astype(str)
+    if "date" in d.columns:
+        d["date"]=pd.to_datetime(d["date"],errors="coerce")
+        # A supplied timestamp is the most precise temporal source for uploaded data.
+        d.loc[d["date"].notna(),"year"]=d.loc[d["date"].notna(),"date"].dt.year
+        d.loc[d["date"].notna(),"month"]=d.loc[d["date"].notna(),"date"].dt.month
+    d["month"]=pd.to_numeric(d["month"],errors="coerce").fillna(1).clip(1,12).astype(int)
+    season_lookup={12:"Summer",1:"Summer",2:"Summer",3:"Autumn",4:"Autumn",5:"Autumn",6:"Winter",7:"Winter",8:"Winter",9:"Spring",10:"Spring",11:"Spring"}
+    d["season"]=d["season"].replace("Unknown",np.nan).fillna(d["month"].map(season_lookup)).fillna("Unknown").astype(str)
+    if "date" not in d.columns or d["date"].isna().all():
+        d["date"]=pd.to_datetime(d["year"].astype(int).astype(str)+"-"+d["month"].astype(int).astype(str)+"-01",errors="coerce")
+    else:
+        missing=d["date"].isna()
+        d.loc[missing,"date"]=pd.to_datetime(d.loc[missing,"year"].astype(int).astype(str)+"-"+d.loc[missing,"month"].astype(int).astype(str)+"-01",errors="coerce")
+    d=d.sort_values(["well_id","date"]).reset_index(drop=True)
+    if len(d):
+        origin=d["date"].min()
+        d["time_index"]=((d["date"].dt.year-origin.year)*12 + d["date"].dt.month-origin.month).astype(int)
+    else: d["time_index"]=pd.Series(dtype=int)
+    d["month_sin"]=np.sin(2*np.pi*(d["month"]-1)/12)
+    d["month_cos"]=np.cos(2*np.pi*(d["month"]-1)/12)
     return d
 
-FEATURE_CANDIDATES=["longitude","latitude","dem_m","distance_coast_m","geology_factor","ndvi_mean","ndvi_anomaly","rainfall_mm","et_mm","surface_water_distance_m","distance_lake_wangary_m","pressure_hpa","year"]
+FEATURE_CANDIDATES=["longitude","latitude","dem_m","distance_coast_m","geology_factor","ndvi_mean","ndvi_anomaly","rainfall_mm","et_mm","surface_water_distance_m","distance_lake_wangary_m","pressure_hpa","year","month","time_index","month_sin","month_cos"]
 
 
 def prepare_features(data):
@@ -409,9 +415,9 @@ if TORCH_OK:
             out,_=self.lstm(x); return self.head(out[:,-1,:]).squeeze(-1)
 
 
-def make_sequences(d,X,y,f,seq_len=4):
+def make_sequences(d,X,y,f,seq_len=12):
     if "well_id" not in d or "year" not in d: raise RuntimeError("LSTM requires well_id and year columns")
-    order=d.copy(); order["_row"]=np.arange(len(order)); order=order.sort_values(["well_id","year","_row"])
+    order=d.copy(); order["_row"]=np.arange(len(order)); order=order.sort_values(["well_id","date","_row"])
     xs=[]; ys=[]; rows=[]; groups=[]
     for wid,g in order.groupby("well_id"):
         inds=g["_row"].to_numpy(int); vals=X.iloc[inds].to_numpy(float); tgt=y.iloc[inds].to_numpy(float)
@@ -423,7 +429,7 @@ def make_sequences(d,X,y,f,seq_len=4):
     return np.asarray(xs,dtype=np.float32),np.asarray(ys,dtype=np.float32),np.asarray(rows,int),np.asarray(groups)
 
 
-def fit_lstm(d,X,y,f,seq_len=4):
+def fit_lstm(d,X,y,f,seq_len=12):
     if not TORCH_OK: raise RuntimeError("PyTorch is not installed")
     xs,ys,rows,groups=make_sequences(d,X,y,f,seq_len)
     unique=np.unique(groups)
@@ -452,8 +458,14 @@ def fit_lstm(d,X,y,f,seq_len=4):
 def train_models(data,selected_models):
     d,X,y,f=prepare_features(data)
     if d["well_id"].nunique()<len(d):
-        wells=d["well_id"].astype(str).unique(); rng=np.random.default_rng(42); rng.shuffle(wells); test=set(wells[:max(1,int(.2*len(wells)))])
-        idx_test=np.array([i for i,w in enumerate(d["well_id"].astype(str)) if w in test]); idx_train=np.array([i for i in range(len(d)) if i not in set(idx_test)])
+        # Temporal holdout: last 20% of each well's observations are test data.
+        order=d.copy(); order["_i"]=np.arange(len(d)); order=order.sort_values(["well_id","date"])
+        test_rows=[]; train_rows=[]
+        for _,g in order.groupby("well_id",sort=False):
+            inds=g["_i"].to_numpy(int); cut=max(1,int(np.ceil(.2*len(inds))))
+            if len(inds)-cut < 1: cut=1
+            train_rows.extend(inds[:-cut]); test_rows.extend(inds[-cut:])
+        idx_train=np.asarray(train_rows,dtype=int); idx_test=np.asarray(test_rows,dtype=int)
     else: idx_train,idx_test=train_test_split(np.arange(len(d)),test_size=.2,random_state=42)
     results={}; preds={}; imps={}; models={}
     for name in selected_models:
@@ -538,9 +550,9 @@ def draw_surface(fig,df,col):
     gj={"type":"FeatureCollection","features":features}
     locations=[f["id"] for f in features]
     if hasattr(go,"Choroplethmap"):
-        fig.add_trace(go.Choroplethmap(geojson=gj,locations=locations,z=z,featureidkey="id",colorscale=[[0,"#0b5963"],[.45,"#35b7aa"],[.72,"#9cd8c8"],[1,"#d0b45e"]],marker_line_width=0,opacity=.34,showscale=False,hoverinfo="skip",name="Piezometric surface"))
+        fig.add_trace(go.Choroplethmap(geojson=gj,locations=locations,z=z,featureidkey="id",colorscale=[[0,"#0b5963"],[.45,"#35b7aa"],[.72,"#9cd8c8"],[1,"#d0b45e"]],marker=dict(line=dict(width=0),opacity=.34),showscale=False,hoverinfo="skip",name="Piezometric surface"))
     else:
-        fig.add_trace(go.Choroplethmapbox(geojson=gj,locations=locations,z=z,featureidkey="id",colorscale=[[0,"#0b5963"],[.45,"#35b7aa"],[.72,"#9cd8c8"],[1,"#d0b45e"]],marker_line_width=0,opacity=.34,showscale=False,hoverinfo="skip",name="Piezometric surface"))
+        fig.add_trace(go.Choroplethmapbox(geojson=gj,locations=locations,z=z,featureidkey="id",colorscale=[[0,"#0b5963"],[.45,"#35b7aa"],[.72,"#9cd8c8"],[1,"#d0b45e"]],marker=dict(line=dict(width=0),opacity=.34),showscale=False,hoverinfo="skip",name="Piezometric surface"))
 
 
 # ============================================================
@@ -645,7 +657,7 @@ def load_well_points_upload(uploaded_file):
 # ============================================================
 # STATE / SIDEBAR
 # ============================================================
-if "dataset" not in st.session_state: st.session_state.dataset="Upload CSV"
+if "dataset" not in st.session_state: st.session_state.dataset="Use demo data"
 if "uploaded_df" not in st.session_state: st.session_state.uploaded_df=None
 if "active_model" not in st.session_state: st.session_state.active_model=None
 if "models_loaded" not in st.session_state: st.session_state.models_loaded=False
@@ -675,17 +687,10 @@ with st.sidebar:
             except Exception as exc: st.error(f"CSV could not be read: {exc}")
     else:
         st.session_state.dataset="Use demo data"
-        st.markdown("### Synthetic time horizon")
-        synthetic_horizon=st.selectbox(
-            "Synthetic modelling horizon",
-            ["1 year · seasonal","3 years · recurring variability","10 years · long-term trend"],
-            index=0,
-            help="1 year emphasises seasonal structure; 3 years adds recurring inter-annual variability; 10 years provides a longer synthetic series for trend-modelling demonstrations."
-        )
-        horizon_years={"1 year · seasonal":1,"3 years · recurring variability":3,"10 years · long-term trend":10}[synthetic_horizon]
-        st.session_state["synthetic_horizon_label"]=synthetic_horizon
-        st.session_state["synthetic_years"]=horizon_years
-        st.caption("Synthetic data are scenario data, not observed measurements. Each option keeps approximately 1,200 records while changing temporal coverage.")
+        st.markdown("### Synthetic training dataset")
+        st.session_state["synthetic_years"]=5
+        st.session_state["synthetic_horizon_label"]="5 years · monthly time series"
+        st.caption("Fixed demo dataset: 1,200 well points × 60 monthly observations = 72,000 synthetic records (2021–2025). Scenario data only; not observed measurements.")
     st.markdown("### Well-point geometry")
     wp_upload=st.file_uploader("Upload well-point layer (ZIP SHP / GeoJSON)",type=["zip","geojson","json","gpkg"],help="For the demo, supplied points anchor the synthetic wells. The selected horizon repeats each well through time so temporal models can learn seasonal, recurring, or long-term patterns.")
     if wp_upload is not None and st.session_state.get("well_points_filename") != getattr(wp_upload,"name",""):
@@ -710,12 +715,9 @@ if st.session_state.dataset=="Upload CSV":
     # are only used in the demo-data mode.
     base=st.session_state.uploaded_df
 else:
-    horizon_years=st.session_state.get("synthetic_years",1)
-    # Keep roughly 1,200 records per synthetic horizon.
-    n_synth_wells=max(30,int(round(1200/(4*horizon_years))))
-    if well_points is not None:
-        n_synth_wells=min(n_synth_wells,len(well_points))
-    base=make_data(n_wells=n_synth_wells,years=horizon_years,well_points=well_points)
+    # Always load the complete five-year synthetic monthly time series on startup.
+    # 1,200 fixed spatial well locations are repeated through 60 months.
+    base=make_data(n_wells=1200,years=5,well_points=well_points)
 if "geology_factor" not in base.columns: base=base.copy(); base["geology_factor"]=0.0
 for c in FEATURE_CANDIDATES:
     if c not in base.columns: base[c]=np.nan
@@ -770,9 +772,15 @@ if not selected:
     st.warning("Select at least one model. Open Model lab to train and load an active model."); st.stop()
 
 # Train only after the user explicitly asks for model training on Model lab, or on first page load.
-train_now = (not st.session_state.models_loaded)
-d0,X,y,f,results,preds,imps,models,comparison=train_models(base,tuple(selected))
-st.session_state.models_loaded=True
+# Training is explicit in Model Lab. This keeps the spatial/temporal demo responsive
+# on startup while still allowing real uploaded observations to train the models.
+if "trained_signature" not in st.session_state: st.session_state.trained_signature=None
+trained_sig=st.session_state.get("trained_signature")
+if trained_sig == (st.session_state.dataset, tuple(selected), len(base), int(base["well_id"].nunique())) and st.session_state.get("trained_bundle") is not None:
+    d0,X,y,f,results,preds,imps,models,comparison=st.session_state.trained_bundle
+else:
+    d0,X,y,f=prepare_features(base)
+    results={}; preds={}; imps={}; models={}; comparison=pd.DataFrame()
 valid_models=[name for name in selected if name in comparison.Model.tolist()] if not comparison.empty else []
 if st.session_state.active_model not in valid_models:
     st.session_state.active_model = None
@@ -797,7 +805,7 @@ if view=="Overview":
     st.markdown('<div class="section">Hydrologic context</div>',unsafe_allow_html=True)
     a,b,c,e=st.columns(4); a.metric("Wells",f"{d.well_id.nunique():,}"); b.metric("Observations",f"{len(d):,}"); c.metric("DEA coastline",str(st.session_state.get("coast_year")) if coastline_gdf is not None else "Unavailable"); e.metric("Lake Wangary",f"{lake_level:.1f} m AHD" if lake_selected else "Off")
     if st.session_state.dataset=="Use demo data":
-        st.caption(f"Synthetic horizon: {st.session_state.get('synthetic_horizon_label','1 year · seasonal')} · {d.well_id.nunique():,} repeated wells · {len(d):,} synthetic observations. Use the horizon toggle in the sidebar to change temporal coverage.")
+        st.caption(f"Synthetic training series: 1,200 fixed wells × 60 monthly observations · {len(d):,} records · 2021–2025. This is scenario data for modelling demonstrations, not observed groundwater measurements.")
     elif d.well_id.nunique()!=len(d):
         st.caption(f"Uploaded temporal dataset: {d.well_id.nunique():,} unique wells across {len(d):,} observations.")
     if coastline_gdf is not None:
@@ -852,6 +860,15 @@ elif view=="Model lab":
     st.markdown('<div class="section">Model training & active-model selection</div>',unsafe_allow_html=True)
     st.markdown('<div class="panel panel-accent"><b>Train → compare → load</b><div class="small">Select candidate models, train them on the same holdout structure, compare RMSE / MAE / R², then explicitly load one model as the active prediction layer. All downstream pages follow the active model selected here.</div></div>',unsafe_allow_html=True)
     available_results=sorted(comparison.Model.tolist()) if not comparison.empty else []
+    if st.button("Train selected models on current data",use_container_width=True,type="primary"):
+        with st.spinner("Training models on the current groundwater time series…"):
+            bundle=train_models(base,tuple(selected))
+        st.session_state.trained_bundle=bundle
+        st.session_state.trained_signature=(st.session_state.dataset, tuple(selected), len(base), int(base["well_id"].nunique()))
+        st.session_state.models_loaded=True
+        st.rerun()
+    if st.session_state.dataset=="Use demo data":
+        st.info("Demo training set: 1,200 fixed wells × 60 monthly observations (5 years). For a real study, switch to Upload CSV and train on the uploaded observations.")
     c1,c2=st.columns([1.2,1.8])
     with c1:
         st.markdown('#### Active model')
@@ -893,10 +910,10 @@ elif view=="Well explorer":
     if not active:
         st.info("Load an active model from Model Lab first.")
         st.stop()
-    w=st.selectbox("Well",d.well_id.astype(str).unique().tolist()); rd=d[d.well_id.astype(str)==w].sort_values("year"); r=rd.iloc[-1]
+    w=st.selectbox("Well",d.well_id.astype(str).unique().tolist()); rd=d[d.well_id.astype(str)==w].sort_values("date"); r=rd.iloc[-1]
     a,b,c,e=st.columns(4); a.metric("Observed",f"{r.groundwater_level_mAHD:.2f} m AHD"); b.metric(f"{active} prediction",f"{r.active_prediction_mAHD:.2f} m AHD" if pd.notna(r.active_prediction_mAHD) else "—"); c.metric("Residual",f"{r.active_residual_m:.2f} m" if pd.notna(r.active_residual_m) else "—"); e.metric("DEM",f"{r.dem_m:.2f} m")
-    st.dataframe(rd[["well_id","year","season","groundwater_level_mAHD","active_prediction_mAHD","active_residual_m","dem_m","distance_coast_m","distance_lake_wangary_m","geology"]],use_container_width=True,hide_index=True)
-    fig=px.line(rd,x="year",y=["groundwater_level_mAHD","active_prediction_mAHD"],markers=True,title=f"Observed vs {active} prediction — {w}"); st.plotly_chart(teal_template(fig),use_container_width=True)
+    st.dataframe(rd[["well_id","date","year","month","season","groundwater_level_mAHD","active_prediction_mAHD","active_residual_m","dem_m","distance_coast_m","distance_lake_wangary_m","geology"]],use_container_width=True,hide_index=True)
+    fig=px.line(rd,x="date",y=["groundwater_level_mAHD","active_prediction_mAHD"],markers=True,title=f"Observed vs {active} prediction — {w}"); st.plotly_chart(teal_template(fig),use_container_width=True)
 
 elif view=="Diagnostics":
     st.markdown('<div class="section">Active model diagnostics</div>',unsafe_allow_html=True)
@@ -940,6 +957,6 @@ else:
 
 st.markdown("---")
 if st.session_state.dataset=="Use demo data":
-    st.caption(f"Demo synthetic mode · {st.session_state.get('synthetic_horizon_label','1 year · seasonal')} · scenario data for temporal modelling. Upload CSV observations at any time to retain and analyse real/read data instead.")
+    st.caption("Demo synthetic mode · 5 years monthly · 1,200 fixed wells · 72,000 scenario observations. Switch to Upload CSV to train on real/read observations.")
 else:
     st.caption(f"Research workspace · Rizin AOI + DEA Coastlines {st.session_state.get('coast_year','—')} + hydrologic anchors + spatial well extraction + RF / GAM / XGBoost / LSTM model comparison on the uploaded dataset.")
