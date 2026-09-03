@@ -108,7 +108,7 @@ DATA_DIR = Path(__file__).resolve().parent
 RIZIN_GEOJSON = DATA_DIR / "rizin.geojson"
 RIZIN_SHP = DATA_DIR / "rizin.shp"
 
-LAKE_WANGARY = {"name":"Lake Wangary", "latitude":-34.54259, "longitude":135.49462, "level_mAHD":3.0}
+LAKE_WANGARY = {"name":"Lake Wangary", "latitude":-34.54259, "longitude":135.49462, "level_mAHD":2.5}
 COAST_ANCHOR = {"name":"Coastal boundary", "level_mAHD":0.0}
 
 @st.cache_data
@@ -1125,16 +1125,52 @@ def normalise_subsurface_input(df):
     return d.dropna(subset=["well_id","longitude","latitude"]).copy()
 
 def sheet_url_to_csv(share_url):
-    """Convert a Google Sheets share URL to its CSV export URL."""
+    """Convert a Google Sheets share URL into a public CSV/Google Visualization URL."""
     if not share_url or not isinstance(share_url, str):
         return None
-    match=re.search(r"/d/([a-zA-Z0-9-_]+)",share_url)
+    match = re.search(r"/spreadsheets/d/([a-zA-Z0-9_-]+)", share_url.strip())
     if not match:
         return None
-    sheet_id=match.group(1)
-    gid_match=re.search(r"[#?&]gid=(\d+)",share_url)
-    gid=gid_match.group(1) if gid_match else "0"
-    return f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
+    sheet_id = match.group(1)
+    gid_match = re.search(r"(?:[#?&]gid=)(\d+)", share_url)
+    gid = gid_match.group(1) if gid_match else "0"
+    return f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv&gid={gid}"
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_public_google_sheet(csv_url):
+    """Fetch a Google Sheet shared for public viewing and return a DataFrame.
+
+    The request deliberately uses Google's public CSV/Visualization endpoint, so
+    no service-account credentials are required. Clear errors are raised for
+    private/unpublished sheets and malformed responses.
+    """
+    import requests
+    from io import StringIO
+
+    headers = {"User-Agent": "CB-HYDRO-Streamlit/1.0"}
+    response = requests.get(csv_url, headers=headers, timeout=20, allow_redirects=True)
+    response.raise_for_status()
+
+    content_type = (response.headers.get("content-type") or "").lower()
+    text = response.text.lstrip("\ufeff").strip()
+
+    # A private Google Sheet commonly redirects to an HTML login/error page.
+    if "<html" in text[:500].lower() or "<!doctype" in text[:500].lower():
+        raise PermissionError(
+            "Google returned an HTML page instead of sheet data. "
+            "Set Share → General access → Anyone with the link → Viewer."
+        )
+
+    if not text:
+        raise ValueError("The Google Sheet returned an empty response.")
+
+    # CSV parsing is more reliable here than trying to use gspread without credentials.
+    frame = pd.read_csv(StringIO(text))
+    if frame.empty:
+        raise ValueError("The Google Sheet contains no data rows.")
+
+    return frame
 
 
 # ============================================================
@@ -1191,29 +1227,62 @@ with st.sidebar:
         sheet_url=st.text_input(
             "Google Sheets share link",
             value=st.session_state.get("live_sheet_url", ""),
-            help="Open your sheet → Share → 'Anyone with the link' → Viewer. Paste the full share URL here."
-        )
+            help="Open your sheet → Share → General access → Anyone with the link → Viewer. Paste the full share URL here."
+        ).strip()
+
+        previous_url=st.session_state.get("live_sheet_url", "")
         st.session_state.live_sheet_url=sheet_url
-        if sheet_url:
+
+        # Fetch only when the URL changes or no dataset has been loaded yet.
+        # This prevents unnecessary requests on unrelated Streamlit reruns.
+        should_fetch = bool(sheet_url) and (
+            sheet_url != previous_url or st.session_state.get("live_sheet_df") is None
+        )
+
+        if not sheet_url:
+            st.session_state.live_sheet_df=None
+            st.session_state.live_sheet_error=None
+            st.info("Paste a Google Sheets share link to load the live dataset.")
+
+        elif should_fetch:
             csv_url=sheet_url_to_csv(sheet_url)
             if csv_url is None:
-                st.error("Couldn't parse that as a Google Sheets link. Check it's a full share URL.")
                 st.session_state.live_sheet_df=None
+                st.session_state.live_sheet_error="Couldn't parse that as a Google Sheets link. Paste the full URL from the browser."
+                st.error(st.session_state.live_sheet_error)
             else:
                 try:
-                    incoming=normalise_columns(pd.read_csv(csv_url))
+                    incoming=normalise_columns(fetch_public_google_sheet(csv_url))
                     incoming=apply_dem_open_meteo_fallback(incoming)
                     if incoming.empty:
                         raise ValueError("The sheet contains no data rows.")
-                    st.success(f"Live sheet connected — {len(incoming)} rows loaded.")
+
+                    # Persist the authoritative fetched dataset across reruns.
                     st.session_state.live_sheet_df=incoming
+                    st.session_state.live_sheet_error=None
+                    st.session_state.live_sheet_loaded_url=sheet_url
                     st.session_state.models_loaded=False
                     st.session_state.active_model=None
-                except Exception as e:
+                    st.success(f"DATA · LOADED — {len(incoming):,} rows from Google Sheets.")
+                except PermissionError as exc:
                     st.session_state.live_sheet_df=None
-                    st.error(f"Could not read that sheet as CSV — confirm sharing is set to 'Anyone with the link can view'. ({e})")
+                    st.session_state.live_sheet_error=str(exc)
+                    st.error("Google Sheet access denied. Set the sheet to “Anyone with the link → Viewer”.")
+                    st.caption(str(exc))
+                except requests.RequestException as exc:
+                    st.session_state.live_sheet_df=None
+                    st.session_state.live_sheet_error=f"Google Sheets request failed: {exc}"
+                    st.error("Could not reach Google Sheets. Check the link and your internet connection.")
+                except Exception as exc:
+                    st.session_state.live_sheet_df=None
+                    st.session_state.live_sheet_error=str(exc)
+                    st.error(f"Could not load the Google Sheet: {exc}")
         else:
-            st.info("Paste a Google Sheets share link to load the live dataset.")
+            # The data is already in session_state, so show a persistent loaded state.
+            if st.session_state.get("live_sheet_df") is not None:
+                st.success(f"DATA · LOADED — {len(st.session_state.live_sheet_df):,} rows from Google Sheets.")
+            elif st.session_state.get("live_sheet_error"):
+                st.error(st.session_state.live_sheet_error)
     else:
         st.session_state.dataset="Use demo data"
         st.markdown("### Synthetic training dataset")
@@ -1280,7 +1349,7 @@ with st.sidebar:
     st.markdown("### Hydrologic controls")
     coastal_anchor=st.number_input("Coastal boundary · m AHD",value=0.0,step=.1,format="%.1f")
     lake_selected=st.checkbox("Use Lake Wangary anchor",value=True)
-    lake_level=st.number_input("Lake Wangary · m AHD",value=3.0,step=.1,format="%.1f",disabled=not lake_selected)
+    lake_level=st.number_input("Lake Wangary · m AHD",value=2.5,step=.1,format="%.1f",disabled=not lake_selected)
     LAKE_WANGARY["level_mAHD"] = float(lake_level)
     COAST_ANCHOR["level_mAHD"] = float(coastal_anchor)
     st.caption("Datum anchors are used by the conceptual surface preview; validate surveyed levels before scientific use.")
@@ -1372,7 +1441,7 @@ if view=="Overview":
         st.markdown(f'<div class="hydro-good"><b>Distance-to-coast engine:</b> shortest perpendicular distance from each well to the clipped DEA annual shoreline for <b>{st.session_state.get("coast_year")}</b>, calculated in EPSG:28353 metres.</div>',unsafe_allow_html=True)
     else:
         st.warning(st.session_state.get("coastline_status","DEA coastline not loaded"))
-    st.markdown('<div class="panel panel-accent"><b>Conceptual control points</b><div class="small">The piezometric surface is interpreted relative to two explicit surface-water / datum anchors rather than as an unconstrained black-box prediction.</div><div class="anchor-card">COASTAL BOUNDARY · <b>0.0 m AHD</b> — near-coast hydraulic datum</div><div class="anchor-card">LAKE WANGARY · <b>3.0 m AHD</b> — selected surface-water level anchor</div></div>',unsafe_allow_html=True)
+    st.markdown('<div class="panel panel-accent"><b>Conceptual control points</b><div class="small">The piezometric surface is interpreted relative to two explicit surface-water / datum anchors rather than as an unconstrained black-box prediction.</div><div class="anchor-card">COASTAL BOUNDARY · <b>0.0 m AHD</b> — near-coast hydraulic datum</div><div class="anchor-card">LAKE WANGARY · <b>2.5 m AHD</b> — selected surface-water level anchor</div></div>',unsafe_allow_html=True)
     st.markdown('<div class="section">Hydrogeographic response</div>',unsafe_allow_html=True)
     if active:
         fig=px.scatter(d,x="dem_m",y="groundwater_level_mAHD",color="active_prediction_mAHD",hover_name="well_id",hover_data=["geology_formation","distance_coast_m","year","season"],color_continuous_scale=[[0,"#075a67"],[.48,"#37b9ae"],[1,"#d3b355"]],labels={"dem_m":"DEM elevation (m)","groundwater_level_mAHD":"Observed groundwater (m AHD)","active_prediction_mAHD":f"{active} prediction (m AHD)"})
@@ -1381,7 +1450,7 @@ if view=="Overview":
     else:
         st.info("No model is loaded. Train models in Model Lab and choose **Load as active model** to populate prediction layers.")
         st.plotly_chart(make_map(d,"groundwater_level_mAHD","Observed groundwater · hydrogeographic reference",coastline_gdf=coastline_gdf,show_coastline=show_coastline),use_container_width=True)
-    st.markdown('<div class="map-caption"><span>Rizin boundary shown as the study-area frame.</span><span>Lake Wangary = 3 m AHD anchor · coastal datum = 0 m AHD.</span></div>',unsafe_allow_html=True)
+    st.markdown('<div class="map-caption"><span>Rizin boundary shown as the study-area frame.</span><span>Lake Wangary = 2.5 m AHD anchor · coastal datum = 0 m AHD.</span></div>',unsafe_allow_html=True)
 
 elif view=="Piezometric map":
     st.markdown('<div class="section">Piezometric surface explorer</div>',unsafe_allow_html=True)
