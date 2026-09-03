@@ -58,48 +58,219 @@ st.set_page_config(
 )
 
 # ============================================================
-# FUTURISTIC BLUE-GREEN HYDROLOGY UI
+# PREMIUM MIDNIGHT-TEAL HYDROLOGY UI
+# Visual layer only: geographic/data/model logic below is unchanged.
 # ============================================================
 st.markdown(
     """
     <style>
     :root{
-      --ink:#123b42;--deep:#075f69;--teal:#0f8f91;--aqua:#35c4b5;
-      --pale:#edf9f6;--mint:#f8fcfb;--sand:#f3efe2;--line:#cbe7e1;
-      --muted:#6a8587;--amber:#c7a24a;--navy:#0a3d46
+      --bg:#06090e; --sidebar:#080d14; --tile:#0c131a; --tile2:#101a22;
+      --text:#e2e8f0; --muted:#94a3b8; --emerald:#10b981; --emerald2:#059669;
+      --line:rgba(226,232,240,.10); --line-green:rgba(16,185,129,.32);
+      --amber:#f59e0b; --blue:#60a5fa;
     }
     html,body,[class*="css"]{font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+    html,body{background:var(--bg)!important;color:var(--text)!important}
     .stApp{background:
-      radial-gradient(circle at 88% 0%,rgba(52,196,181,.09),transparent 26%),
-      radial-gradient(circle at 10% 10%,rgba(8,95,105,.08),transparent 30%),
-      linear-gradient(135deg,#f1faf8 0%,#f9f8f2 55%,#edf8f6 100%);
-      color:var(--ink)}
-    [data-testid="stHeader"]{background:rgba(248,253,252,.82);backdrop-filter:blur(12px)}
-    [data-testid="stSidebar"]{background:linear-gradient(180deg,#083f48 0%,#075965 48%,#0a4951 100%);border-right:1px solid rgba(255,255,255,.08)}
-    [data-testid="stSidebar"] *{color:#eefcf9!important}
-    [data-testid="stSidebar"] .stCaption{color:#b8d7d2!important}
-    [data-testid="stSidebar"] .stMultiSelect [data-baseweb="tag"]{background:rgba(53,196,181,.86)!important;border:0!important}
-    [data-testid="stSidebar"] .stRadio > div{gap:.2rem}
-    .hero{background:linear-gradient(135deg,rgba(255,255,255,.96),rgba(236,250,247,.92));border:1px solid var(--line);border-radius:24px;padding:22px 26px;box-shadow:0 18px 40px rgba(11,73,77,.08);position:relative;overflow:hidden}
-    .hero:after{content:"";position:absolute;right:-30px;top:-55px;width:190px;height:190px;border-radius:50%;background:radial-gradient(circle,rgba(52,196,181,.24),rgba(52,196,181,0) 66%)}
-    .hero-title{font-size:31px;font-weight:850;letter-spacing:-.8px;margin:0;color:var(--ink)}
-    .hero-sub{margin-top:4px;color:var(--muted);font-size:13px}
-    .chip{display:inline-block;margin-top:12px;padding:6px 11px;border-radius:999px;background:#e3f5ef;color:#0a6a5f;font-size:11px;font-weight:800;letter-spacing:.2px}
-    .section{font-size:18px;font-weight:850;color:var(--ink);margin:20px 0 10px}
-    .panel{background:rgba(255,255,255,.93);border:1px solid var(--line);border-radius:18px;padding:16px 18px;box-shadow:0 9px 26px rgba(15,76,76,.055)}
-    .panel-accent{background:linear-gradient(135deg,#f7fffd,#eef9f4);border:1px solid #bfe1d9}
-    .hydro-note{background:#fffdf0;border:1px solid #e8dfb1;border-left:5px solid var(--amber);border-radius:14px;padding:12px 14px;color:#5c542f;font-size:12px}
-    .hydro-good{background:#ebfaf4;border:1px solid #bce1d5;border-left:5px solid var(--teal);border-radius:14px;padding:12px 14px;color:#1f5f54;font-size:12px}
-    .small{font-size:12px;color:var(--muted)}
-    .anchor-card{padding:10px 12px;border-radius:14px;background:#f4fbf8;border:1px solid #cfe8e1;margin-top:7px}
-    div[data-testid="stMetric"]{background:rgba(255,255,255,.95);border:1px solid var(--line);padding:12px 14px;border-radius:16px;box-shadow:0 7px 19px rgba(16,73,73,.05)}
-    .stButton>button,.stDownloadButton>button{border-radius:11px!important;border:1px solid #9ed9ce!important;background:#fff!important;color:#0b6664!important;font-weight:700!important}
-    .stButton>button:hover,.stDownloadButton>button:hover{border-color:#63c3b4!important;background:#effaf7!important}
-    .map-caption{display:flex;justify-content:space-between;gap:14px;flex-wrap:wrap;color:#668587;font-size:11px;margin-top:-8px;margin-bottom:4px}
+      radial-gradient(circle at 82% -8%,rgba(16,185,129,.12),transparent 30%),
+      radial-gradient(circle at 12% 18%,rgba(5,150,105,.07),transparent 28%),
+      radial-gradient(circle at 55% 115%,rgba(16,185,129,.055),transparent 32%),
+      linear-gradient(135deg,#06090e 0%,#071017 52%,#06090e 100%);
+      color:var(--text)!important;
+    }
+    [data-testid="stAppViewContainer"], [data-testid="stAppViewContainer"] > .main{background:transparent!important;color:var(--text)!important}
+    [data-testid="stHeader"]{background:rgba(6,9,14,.72)!important;backdrop-filter:blur(18px);border-bottom:1px solid rgba(226,232,240,.05)}
+    [data-testid="stToolbar"]{background:transparent!important}
+    [data-testid="stSidebar"]{background:
+      radial-gradient(circle at 0% 0%,rgba(16,185,129,.08),transparent 28%),
+      linear-gradient(180deg,#080d14 0%,#080d14 65%,#070b11 100%)!important;
+      border-right:1px solid rgba(226,232,240,.08)!important;
+    }
+    [data-testid="stSidebar"] *{color:var(--text)!important}
+    [data-testid="stSidebar"] .stCaption,[data-testid="stSidebar"] small{color:var(--muted)!important}
+    [data-testid="stSidebar"] h1,[data-testid="stSidebar"] h2,[data-testid="stSidebar"] h3{color:#fff!important}
+    [data-testid="stSidebar"] h3{letter-spacing:.02em}
+
+    /* Sidebar navigation: compact, tactile, non-default */
+    [data-testid="stSidebar"] [data-testid="stRadio"] > label{display:none}
+    [data-testid="stSidebar"] [data-testid="stRadio"] [role="radiogroup"]{gap:4px!important}
+    [data-testid="stSidebar"] [data-testid="stRadio"] [role="radio"]{
+      min-height:38px!important;border:1px solid transparent!important;border-radius:11px!important;
+      padding:7px 10px!important;background:transparent!important;transition:all .18s ease!important;
+    }
+    [data-testid="stSidebar"] [data-testid="stRadio"] [role="radio"]:hover{background:rgba(16,185,129,.07)!important;border-color:rgba(16,185,129,.14)!important}
+    [data-testid="stSidebar"] [data-testid="stRadio"] [role="radio"][aria-checked="true"]{
+      background:linear-gradient(90deg,rgba(16,185,129,.14),rgba(16,185,129,.035))!important;
+      border-color:rgba(16,185,129,.22)!important;box-shadow:inset 2px 0 0 var(--emerald),0 5px 18px rgba(0,0,0,.12)!important;
+    }
+    [data-testid="stSidebar"] [data-testid="stRadio"] [role="radio"] > div:first-child{display:none!important}
+    [data-testid="stSidebar"] [data-testid="stRadio"] [role="radio"] p{font-size:13px!important;font-weight:650!important;margin:0!important}
+
+    /* Select/input tiles */
+    div[data-baseweb="select"],div[data-baseweb="input"],.stTextInput input,
+    .stNumberInput input,.stTextArea textarea{
+      background:#0c131a!important;color:#e2e8f0!important;border-color:rgba(226,232,240,.11)!important;
+    }
+    div[data-baseweb="select"] *{color:#e2e8f0!important}
+    div[data-baseweb="select"] > div{background:#0c131a!important;border-color:rgba(226,232,240,.11)!important;border-radius:10px!important}
+    .stTextInput input,.stNumberInput input,.stTextArea textarea{border-radius:10px!important;box-shadow:inset 0 0 0 1px rgba(226,232,240,.05)!important}
+    .stTextInput input:focus,.stNumberInput input:focus,.stTextArea textarea:focus{border-color:rgba(16,185,129,.65)!important;box-shadow:0 0 0 1px rgba(16,185,129,.35),0 0 18px rgba(16,185,129,.08)!important}
+    [data-baseweb="popover"]{background:#0c131a!important;border:1px solid rgba(226,232,240,.10)!important}
+    [data-baseweb="menu"]{background:#0c131a!important}
+    [data-baseweb="menu"] *{color:#e2e8f0!important}
+    [data-baseweb="menu"] [aria-selected="true"]{background:rgba(16,185,129,.15)!important}
+
+    /* Checkboxes: emerald tactile control */
+    [data-testid="stCheckbox"]{padding:2px 0!important}
+    [data-testid="stCheckbox"] label{color:var(--text)!important}
+    [data-testid="stCheckbox"] label > div:first-child{background:#0c131a!important;border:1px solid rgba(226,232,240,.20)!important;border-radius:6px!important;box-shadow:inset 0 0 0 1px rgba(0,0,0,.25)!important}
+    [data-testid="stCheckbox"] label > div:first-child:hover{border-color:rgba(16,185,129,.65)!important}
+    [data-testid="stCheckbox"] input:checked + div,[data-testid="stCheckbox"] label > div[aria-checked="true"]{background:linear-gradient(135deg,var(--emerald),var(--emerald2))!important;border-color:var(--emerald)!important;box-shadow:0 0 13px rgba(16,185,129,.24)!important}
+    [data-testid="stCheckbox"] svg{stroke:#fff!important}
+
+    /* Glass cards / metrics */
+    .hero,.panel,.anchor-card,.cb-glass{
+      background:linear-gradient(145deg,rgba(16,25,34,.84),rgba(8,14,20,.76))!important;
+      border:1px solid rgba(226,232,240,.10)!important;border-radius:18px!important;
+      box-shadow:0 18px 50px rgba(0,0,0,.30),inset 0 1px 0 rgba(255,255,255,.035)!important;
+      backdrop-filter:blur(18px)!important;
+    }
+    .hero{padding:22px 25px!important;position:relative;overflow:hidden}
+    .hero:after{content:"";position:absolute;right:-60px;top:-70px;width:210px;height:210px;border-radius:50%;background:radial-gradient(circle,rgba(16,185,129,.16),rgba(16,185,129,0) 68%);pointer-events:none}
+    .hero-title,.section{color:#f8fafc!important}
+    .hero-sub,.small{color:var(--muted)!important}
+    .section{font-size:18px;font-weight:800;margin:20px 0 10px;letter-spacing:-.01em}
+    .panel-accent{background:linear-gradient(145deg,rgba(16,185,129,.09),rgba(8,14,20,.75))!important;border-color:rgba(16,185,129,.20)!important}
+    .hydro-note{background:rgba(245,158,11,.08)!important;border:1px solid rgba(245,158,11,.22)!important;border-left:4px solid var(--amber)!important;border-radius:12px!important;padding:12px 14px;color:#f8d99a!important}
+    .hydro-good{background:rgba(16,185,129,.075)!important;border:1px solid rgba(16,185,129,.22)!important;border-left:4px solid var(--emerald)!important;border-radius:12px!important;padding:12px 14px;color:#b7f7dd!important}
+    .chip{background:rgba(245,158,11,.10)!important;border:1px solid rgba(245,158,11,.24)!important;color:#fbbf24!important}
+    div[data-testid="stMetric"]{background:linear-gradient(145deg,rgba(16,25,34,.86),rgba(8,14,20,.76))!important;border:1px solid rgba(226,232,240,.09)!important;border-radius:15px!important;padding:14px 16px!important;box-shadow:0 14px 34px rgba(0,0,0,.26),inset 0 1px 0 rgba(255,255,255,.035)!important}
+    div[data-testid="stMetricLabel"]{color:#94a3b8!important}
+    div[data-testid="stMetricValue"]{color:#f8fafc!important;font-weight:800!important}
+    div[data-testid="stMetricDelta"]{color:#10b981!important}
+
+    /* Buttons */
+    .stButton>button,.stDownloadButton>button{background:#0c131a!important;color:#e2e8f0!important;border:1px solid rgba(226,232,240,.12)!important;border-radius:10px!important;font-weight:700!important;transition:all .18s ease!important}
+    .stButton>button:hover,.stDownloadButton>button:hover{border-color:rgba(16,185,129,.55)!important;color:#d1fae5!important;background:rgba(16,185,129,.08)!important;box-shadow:0 0 20px rgba(16,185,129,.08)!important}
+    .stButton>button[kind="primary"]{background:linear-gradient(135deg,#059669,#10b981)!important;color:#fff!important;border-color:#10b981!important;box-shadow:0 8px 24px rgba(16,185,129,.18)!important}
+
+    /* Dataframe / tables */
+    [data-testid="stDataFrame"]{border:1px solid rgba(226,232,240,.09)!important;border-radius:14px!important;overflow:hidden!important}
+    [data-testid="stDataFrame"] *{color:#e2e8f0!important}
+    [data-testid="stExpander"]{background:rgba(12,19,26,.72)!important;border:1px solid rgba(226,232,240,.09)!important;border-radius:12px!important}
+    [data-testid="stAlert"]{background:rgba(12,19,26,.78)!important;border-color:rgba(96,165,250,.22)!important;color:#dbeafe!important}
+    .map-caption{color:#94a3b8!important}
+    hr{border-color:rgba(226,232,240,.08)!important}
+
+    /* Mobile/tablet */
+    @media(max-width:900px){
+      [data-testid="stSidebar"]{min-width:280px!important}
+      .hero-title{font-size:25px!important}
+      div[data-testid="stMetric"]{padding:11px!important}
+    }
+    @media(max-width:640px){
+      .block-container{padding:1rem .8rem 2rem!important}
+      .hero{padding:18px!important}
+      [data-testid="stSidebar"]{width:86vw!important}
+    }
     </style>
     """,
     unsafe_allow_html=True,
 )
+
+# ============================================================
+# CINEMATIC THREE.JS PRELOADER — session-state gated
+# Visual-only layer; it tears down before the dashboard becomes interactive.
+# ============================================================
+import threading
+import time
+import streamlit.components.v1 as components
+
+if "cb_app_loaded" not in st.session_state:
+    st.session_state.cb_app_loaded = False
+
+if not st.session_state.cb_app_loaded:
+    st.markdown(
+        """
+        <style>
+        [data-testid="stSidebar"], [data-testid="stHeader"]{visibility:hidden!important}
+        [data-testid="stAppViewContainer"] > .main{padding-top:0!important}
+        [data-testid="stMainBlockContainer"]{padding:0!important;max-width:none!important}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    timer_done = threading.Event()
+    def _preloader_timer():
+        time.sleep(4.0)
+        timer_done.set()
+
+    threading.Thread(target=_preloader_timer, daemon=True).start()
+
+    components.html(
+        """
+        <div id="cb-preloader">
+          <div id="cb-globe"></div>
+          <div class="cb-vignette"></div>
+          <div class="cb-copy">
+            <div class="cb-brand">CoffinBay<span>+</span></div>
+            <div class="cb-sub">Hydrogeoinformatics Workspace...</div>
+          </div>
+          <div class="cb-loader"><i></i></div>
+        </div>
+        <style>
+          html,body{margin:0!important;width:100%;height:100%;overflow:hidden;background:#020409;font-family:Inter,Arial,sans-serif}
+          #cb-preloader{position:fixed;inset:0;z-index:9999;background:radial-gradient(circle at 50% 45%,#0a161b 0%,#03070b 45%,#010205 100%);overflow:hidden}
+          #cb-globe{position:absolute;inset:0}
+          #cb-globe canvas{display:block;width:100%!important;height:100%!important}
+          .cb-vignette{position:absolute;inset:0;background:radial-gradient(circle at 50% 46%,transparent 23%,rgba(0,0,0,.08) 48%,rgba(0,0,0,.72) 100%),linear-gradient(90deg,rgba(0,0,0,.38),transparent 25%,transparent 75%,rgba(0,0,0,.38));pointer-events:none}
+          .cb-copy{position:absolute;left:50%;top:50%;transform:translate(-50%,-40%);text-align:center;color:#fff;pointer-events:none;text-shadow:0 3px 30px rgba(0,0,0,.75);white-space:nowrap}
+          .cb-brand{font-size:clamp(42px,7vw,82px);font-weight:850;letter-spacing:-.055em;line-height:.95}
+          .cb-brand span{color:#10b981}
+          .cb-sub{margin-top:18px;font-size:clamp(14px,1.7vw,20px);letter-spacing:.06em;color:#10b981;font-weight:600}
+          .cb-loader{position:absolute;left:50%;bottom:8%;transform:translateX(-50%);width:min(260px,52vw);height:2px;background:rgba(255,255,255,.12);overflow:hidden;border-radius:99px}
+          .cb-loader i{display:block;height:100%;width:38%;background:linear-gradient(90deg,transparent,#10b981,#6ee7b7,transparent);animation:cb-load 1.1s ease-in-out infinite}
+          @keyframes cb-load{0%{transform:translateX(-140%)}100%{transform:translateX(390%)}}
+        </style>
+        <script type="module">
+          import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js';
+          const host=document.getElementById('cb-globe');
+          const scene=new THREE.Scene();
+          const camera=new THREE.PerspectiveCamera(38,innerWidth/innerHeight,.1,100);
+          camera.position.z=3.15;
+          const renderer=new THREE.WebGLRenderer({antialias:true,alpha:true,powerPreference:'high-performance'});
+          renderer.setPixelRatio(Math.min(devicePixelRatio,2));
+          renderer.setSize(innerWidth,innerHeight); renderer.outputColorSpace=THREE.SRGBColorSpace;
+          host.appendChild(renderer.domElement);
+          const group=new THREE.Group(); scene.add(group);
+          const geo=new THREE.SphereGeometry(1.05,96,96);
+          const loader=new THREE.TextureLoader();
+          const tex=loader.load('https://threejs.org/examples/textures/planets/earth_atmos_2048.jpg');
+          tex.colorSpace=THREE.SRGBColorSpace;
+          const normal=loader.load('https://threejs.org/examples/textures/planets/earth_normal_2048.jpg');
+          const spec=loader.load('https://threejs.org/examples/textures/planets/earth_specular_2048.jpg');
+          const mat=new THREE.MeshPhongMaterial({map:tex,normalMap:normal,specularMap:spec,specular:new THREE.Color(0x163b42),shininess:12});
+          const earth=new THREE.Mesh(geo,mat); group.add(earth);
+          const glow=new THREE.Mesh(new THREE.SphereGeometry(1.075,64,64),new THREE.MeshBasicMaterial({color:0x10b981,transparent:true,opacity:.045,side:THREE.BackSide})); group.add(glow);
+          scene.add(new THREE.AmbientLight(0x8fdcc9,.48));
+          const key=new THREE.DirectionalLight(0xffffff,2.1); key.position.set(4,2,5); scene.add(key);
+          const rim=new THREE.PointLight(0x10b981,1.6,7); rim.position.set(-3,1,2); scene.add(rim);
+          function resize(){camera.aspect=innerWidth/innerHeight;camera.updateProjectionMatrix();renderer.setSize(innerWidth,innerHeight)}
+          addEventListener('resize',resize);
+          function animate(){requestAnimationFrame(animate);group.rotation.y-=0.0019;group.rotation.x=0.035;renderer.render(scene,camera)} animate();
+        </script>
+        """,
+        height=900,
+        scrolling=False,
+    )
+
+    # Poll the background timer without touching Streamlit state from the worker thread.
+    while not timer_done.is_set():
+        time.sleep(0.08)
+    st.session_state.cb_app_loaded = True
+    st.rerun()
 
 # ============================================================
 # STUDY-AREA / HYDROLOGIC CONTEXT
@@ -936,8 +1107,8 @@ def draw_surface(fig,df,col):
 # ============================================================
 
 def teal_template(fig):
-    fig.update_layout(paper_bgcolor="rgba(0,0,0,0)",plot_bgcolor="#ffffff",font=dict(color="#17363a",family="Inter,Arial"),margin=dict(l=8,r=8,t=48,b=8),legend=dict(orientation="h",y=1.08,x=0))
-    fig.update_xaxes(showgrid=True,gridcolor="#e7f0ee"); fig.update_yaxes(showgrid=True,gridcolor="#e7f0ee"); return fig
+    fig.update_layout(paper_bgcolor="rgba(0,0,0,0)",plot_bgcolor="#0c131a",font=dict(color="#e2e8f0",family="Inter,Arial"),margin=dict(l=8,r=8,t=48,b=8),legend=dict(orientation="h",y=1.08,x=0))
+    fig.update_xaxes(showgrid=True,gridcolor="rgba(148,163,184,.12)",zerolinecolor="rgba(148,163,184,.12)"); fig.update_yaxes(showgrid=True,gridcolor="rgba(148,163,184,.12)",zerolinecolor="rgba(148,163,184,.12)"); return fig
 
 
 def render_sgd_heatmap(coastal_df, total_sgd):
@@ -1037,10 +1208,10 @@ def make_map(df,value_col,title,height=710,center=None,zoom=9.2,show_anchors=Tru
         if show_coastline:add_coastline_trace(fig,coastline_gdf)
         add_boundary_trace(fig)
         if show_anchors:
-            fig.add_trace(go.Scattermap(lat=[LAKE_WANGARY["latitude"]],lon=[LAKE_WANGARY["longitude"]],mode="markers+text",marker=dict(size=15,color="#19786f",symbol="diamond"),text=[f"LAKE WANGARY · {LAKE_WANGARY['level_mAHD']:.1f} m AHD"],textposition="top center",textfont=dict(size=11,color="#124d52"),name="Lake Wangary anchor",hovertext=[f"Surface-water anchor · {LAKE_WANGARY['level_mAHD']:.2f} m AHD"],hoverinfo="text"))
+            fig.add_trace(go.Scattermap(lat=[LAKE_WANGARY["latitude"]],lon=[LAKE_WANGARY["longitude"]],mode="markers+text",marker=dict(size=15,color="#19786f",symbol="diamond"),text=[f"LAKE WANGARY · {LAKE_WANGARY['level_mAHD']:.1f} m AHD"],textposition="top center",textfont=dict(size=11,color="#d1fae5"),name="Lake Wangary anchor",hovertext=[f"Surface-water anchor · {LAKE_WANGARY['level_mAHD']:.2f} m AHD"],hoverinfo="text"))
             cp=coast_label_point(coastline_gdf,center["lon"],center["lat"])
             if cp is not None:
-                fig.add_trace(go.Scattermap(lat=[float(cp.y)],lon=[float(cp.x)],mode="markers+text",marker=dict(size=10,color="#ef8354",symbol="circle"),text=[f"DEA COAST · {COAST_ANCHOR['level_mAHD']:.1f} m AHD"],textposition="bottom center",textfont=dict(size=10,color="#9a5b3d"),name="Coastal datum anchor",hovertext=[f"DEA Coastlines shoreline · approximately 0 m mean sea level · analysis datum {COAST_ANCHOR['level_mAHD']:.2f} m AHD"],hoverinfo="text"))
+                fig.add_trace(go.Scattermap(lat=[float(cp.y)],lon=[float(cp.x)],mode="markers+text",marker=dict(size=10,color="#ef8354",symbol="circle"),text=[f"DEA COAST · {COAST_ANCHOR['level_mAHD']:.1f} m AHD"],textposition="bottom center",textfont=dict(size=10,color="#fbbf24"),name="Coastal datum anchor",hovertext=[f"DEA Coastlines shoreline · approximately 0 m mean sea level · analysis datum {COAST_ANCHOR['level_mAHD']:.2f} m AHD"],hoverinfo="text"))
     else:
         fig=px.scatter_mapbox(df,lat="latitude",lon="longitude",color=value_col,hover_name="well_id",hover_data=hover_cols,color_continuous_scale=[[0,"#075a67"],[.48,"#37b9ae"],[1,"#d3b355"]],zoom=zoom,height=height,center=center,opacity=.90,size_max=11)
         fig.update_layout(mapbox_style="open-street-map")
