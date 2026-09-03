@@ -4,6 +4,7 @@ import zipfile
 from pathlib import Path
 
 import requests
+import re
 
 import numpy as np
 import pandas as pd
@@ -27,6 +28,20 @@ try:
     XGB_OK = True
 except Exception:
     XGB_OK = False
+
+try:
+    from pykrige.ok import OrdinaryKriging
+    PYKRIGE_OK = True
+except Exception:
+    OrdinaryKriging = None
+    PYKRIGE_OK = False
+
+try:
+    from scipy.interpolate import Rbf
+    SCIPY_OK = True
+except Exception:
+    Rbf = None
+    SCIPY_OK = False
 
 try:
     import torch
@@ -218,6 +233,94 @@ def point_inside_boundary(lon, lat):
 # Wells follow an inland-to-coast corridor inside Rizin, not the
 # Rizin boundary itself. DEM + coast distance are location-driven.
 # ============================================================
+@st.cache_data(show_spinner=False)
+def _fetch_dem_open_meteo_cached(coords, batch_size=100):
+    """Cached Open-Meteo DEM lookup keyed only by rounded (lat, lon) pairs."""
+    elevations=np.full(len(coords),np.nan,dtype=float)
+    batch_size=min(int(batch_size),100)
+    for start in range(0,len(coords),batch_size):
+        chunk=coords[start:start+batch_size]
+        lat_list=",".join(f"{lat:.5f}" for lat,lon in chunk)
+        lon_list=",".join(f"{lon:.5f}" for lat,lon in chunk)
+        url="https://api.open-meteo.com/v1/elevation"
+        params={"latitude":lat_list,"longitude":lon_list}
+        try:
+            resp=requests.get(url,params=params,timeout=30)
+            resp.raise_for_status()
+            values=resp.json().get("elevation",[])
+            if len(values)!=len(chunk):
+                raise ValueError(f"Expected {len(chunk)} elevations, received {len(values)}")
+            elevations[start:start+len(chunk)]=pd.to_numeric(values,errors="coerce")
+        except Exception as e:
+            print(f"Elevation fetch failed for rows {start}-{start+len(chunk)}: {e}")
+    return elevations
+
+
+def fetch_dem_open_meteo(df, lat_col="latitude", lon_col="longitude", batch_size=100):
+    """
+    Fetch terrain elevation from the Open-Meteo Elevation API.
+
+    The API endpoint accepts at most 100 coordinate pairs per request, so
+    requests are always chunked to <=100 points. Results are cached by the
+    rounded latitude/longitude coordinates so Streamlit reruns do not repeat
+    lookups for the same static well locations. Returned elevations preserve
+    the input DataFrame row order.
+    """
+    if lat_col not in df.columns or lon_col not in df.columns:
+        raise ValueError(f"DataFrame must contain {lat_col!r} and {lon_col!r}")
+
+    coords_df=pd.DataFrame({
+        "latitude":pd.to_numeric(df[lat_col],errors="coerce"),
+        "longitude":pd.to_numeric(df[lon_col],errors="coerce")
+    })
+    coords_df["latitude"]=coords_df["latitude"].round(5)
+    coords_df["longitude"]=coords_df["longitude"].round(5)
+
+    unique_coords=list(dict.fromkeys(
+        (float(row.latitude),float(row.longitude))
+        for row in coords_df.itertuples(index=False)
+        if np.isfinite(row.latitude) and np.isfinite(row.longitude)
+    ))
+
+    if not unique_coords:
+        return np.full(len(df),np.nan,dtype=float)
+
+    unique_elevations=_fetch_dem_open_meteo_cached(
+        tuple(unique_coords),
+        batch_size=min(int(batch_size),100)
+    )
+    lookup=dict(zip(unique_coords,unique_elevations))
+
+    return np.array([
+        lookup.get((float(lat),float(lon)),np.nan)
+        if np.isfinite(lat) and np.isfinite(lon) else np.nan
+        for lat,lon in zip(coords_df["latitude"],coords_df["longitude"])
+    ],dtype=float)
+
+
+def apply_dem_open_meteo_fallback(df):
+    """Fill only missing DEM values; never overwrite user-supplied dem_m."""
+    d=df.copy()
+    if "dem_m" not in d.columns:
+        d["dem_m"]=np.nan
+
+    d["dem_m"]=pd.to_numeric(d["dem_m"],errors="coerce")
+    missing=d["dem_m"].isna()
+    if not missing.any():
+        return d
+
+    # Query unique spatial well locations, not every temporal observation.
+    targets=d.loc[missing,["well_id","latitude","longitude"]].drop_duplicates("well_id")
+    if targets.empty:
+        return d
+
+    elevations=fetch_dem_open_meteo(targets,lat_col="latitude",lon_col="longitude",batch_size=100)
+    lookup=dict(zip(targets["well_id"].astype(str),elevations))
+    fetched=d["well_id"].astype(str).map(lookup)
+    d.loc[missing,"dem_m"]=fetched.loc[missing]
+    return d
+
+
 @st.cache_data
 def make_data(n_wells=1200, years=5, seed=42, well_points=None):
     """Create a five-year monthly synthetic groundwater time series.
@@ -264,9 +367,22 @@ def make_data(n_wells=1200, years=5, seed=42, well_points=None):
         lat0=-34.75+rng.uniform(0,.42,n_wells)
         transect_t=(lon0-lon0.min())/(lon0.max()-lon0.min())
 
-    coast_distance=np.clip(140 + 14500*transect_t + rng.normal(0,420,n_wells),25,16000)
-    inlandness=np.clip(coast_distance/np.nanmax(coast_distance),0,1)
-    dem0=np.clip(0.25 + 34*(inlandness**0.72) + rng.normal(0,0.9,n_wells),0.05,40)
+    # Real terrain elevation from Open-Meteo. Coordinates are static per well,
+    # so this lookup happens once per unique coordinate set and is cached.
+    well_coords=pd.DataFrame({"latitude":lat0,"longitude":lon0})
+    dem0=fetch_dem_open_meteo(well_coords,batch_size=100)
+
+    # Keep the demo usable if the external API is temporarily unavailable.
+    # This fallback is only for failed API responses; successful Open-Meteo
+    # elevations always replace the old synthetic DEM generation.
+    if np.isnan(dem0).any():
+        coast_distance=np.clip(140 + 14500*transect_t + rng.normal(0,420,n_wells),25,16000)
+        inlandness=np.clip(coast_distance/np.nanmax(coast_distance),0,1)
+        fallback_dem=np.clip(0.25 + 34*(inlandness**0.72) + rng.normal(0,0.9,n_wells),0.05,40)
+        dem0=np.where(np.isfinite(dem0),dem0,fallback_dem)
+    else:
+        coast_distance=np.clip(140 + 14500*transect_t + rng.normal(0,420,n_wells),25,16000)
+        inlandness=np.clip(coast_distance/np.nanmax(coast_distance),0,1)
     gs=np.array(["Bridgewater Formation","Uley Formation","Wanilla Formation",
                  "Sleaford Complex","Hutchison Supergroup","Kiana Granite"])
     geo0=rng.choice(gs,n_wells,p=[.38,.14,.12,.15,.09,.12])
@@ -278,6 +394,25 @@ def make_data(n_wells=1200, years=5, seed=42, well_points=None):
         ((lon0-LAKE_WANGARY["longitude"])/0.0058)**2 +
         ((lat0-LAKE_WANGARY["latitude"])/0.0048)**2
     )*1000
+
+    # Static per-well hydrogeological structure. These demo values are explicitly
+    # synthetic and are repeated unchanged across all 60 temporal observations.
+    depth_to_basement_m=np.clip(18 + 115*(1-inlandness) + rng.normal(0,7,n_wells),8,160)
+    aquifer_thickness_m=np.clip(4 + 32*inlandness + rng.normal(0,2.5,n_wells),2,45)
+    clay_layer_total_m=np.clip(1.5 + 15*(1-inlandness) + rng.normal(0,1.2,n_wells),0.2,20)
+    hydraulic_conductivity_K=np.clip(
+        pd.Series(geo0).map({
+            "Bridgewater Formation":18.0,"Uley Formation":9.0,"Wanilla Formation":5.0,
+            "Sleaford Complex":2.5,"Hutchison Supergroup":0.8,"Kiana Granite":0.15
+        }).to_numpy() * np.exp(rng.normal(0,0.28,n_wells)), 0.05, 35
+    )
+    specific_yield_Sy=np.clip(
+        pd.Series(geo0).map({
+            "Bridgewater Formation":0.28,"Uley Formation":0.20,"Wanilla Formation":0.16,
+            "Sleaford Complex":0.08,"Hutchison Supergroup":0.05,"Kiana Granite":0.015
+        }).to_numpy() + rng.normal(0,0.018,n_wells), 0.005, 0.35
+    )
+    is_confined=((clay_layer_total_m > 9) & (aquifer_thickness_m > 15)).astype(int)
 
     # Five complete calendar years: 2021-01 through 2025-12.
     dates=pd.date_range("2021-01-01",periods=total_months,freq="MS")
@@ -315,13 +450,17 @@ def make_data(n_wells=1200, years=5, seed=42, well_points=None):
                 + well_effect[i] + rng.normal(0,.30))
             rows.append([
                 f"CB_{i+1:05d}",lon0[i],lat0[i],dem,coast,geo0[i],gf0[i],
+                depth_to_basement_m[i],aquifer_thickness_m[i],clay_layer_total_m[i],
+                hydraulic_conductivity_K[i],specific_yield_Sy[i],is_confined[i],
                 nd,nda,rain,et,sw,pressure,yr,month,dt,season,
                 max(-.15,gw),dist_lake[i],j
             ])
 
     return pd.DataFrame(rows,columns=[
-        "well_id","longitude","latitude","dem_m","distance_coast_m","geology",
-        "geology_factor","ndvi_mean","ndvi_anomaly","rainfall_mm","et_mm",
+        "well_id","longitude","latitude","dem_m","distance_coast_m","geology_formation",
+        "geology_factor","depth_to_basement_m","aquifer_thickness_m","clay_layer_total_m",
+        "hydraulic_conductivity_K","specific_yield_Sy","is_confined",
+        "ndvi_mean","ndvi_anomaly","rainfall_mm","et_mm",
         "surface_water_distance_m","pressure_hpa","year","month","date","season",
         "groundwater_level_mAHD","distance_lake_wangary_m","time_index"
     ])
@@ -329,26 +468,53 @@ def make_data(n_wells=1200, years=5, seed=42, well_points=None):
 
 def normalise_columns(df):
     d=df.copy()
-    aliases={
-        "well_id":["well_id","well","site","id","bore_id"],"longitude":["longitude","lon","x_lon"],"latitude":["latitude","lat","y_lat"],
+    COLUMN_ALIASES={
+        "well_id":["well_id","well","site","id","bore_id"],
+        "longitude":["longitude","lon","x_lon"],
+        "latitude":["latitude","lat","y_lat"],
         "groundwater_level_mAHD":["groundwater_level_mAHD","groundwater_level","water_level","gw_level","head_mAHD"],
-        "dem_m":["dem_m","dem","elevation","elev_m"],"distance_coast_m":["distance_coast_m","coast_distance_m","distance_to_coast_m"],
-        "geology":["geology","formation","lithology"],"season":["season"],"year":["year","date_year"],"month":["month","month_num"],"date":["date","datetime","timestamp","observation_date"]}
+        "dem_m":["dem_m","dem","elevation","elev_m"],
+        "distance_coast_m":["distance_coast_m","coast_distance_m","distance_to_coast_m"],
+        "geology_formation":["geology_formation","formation","lithology"],
+        "depth_to_basement_m":["depth_to_basement_m","basement_depth_m","depth_basement_m"],
+        "aquifer_thickness_m":["aquifer_thickness_m","aquifer_thickness","aquifer_thick_m"],
+        "clay_layer_total_m":["clay_layer_total_m","total_clay_m","clay_thickness_m"],
+        "hydraulic_conductivity_K":["hydraulic_conductivity_K","hydraulic_conductivity","k","conductivity_K"],
+        "specific_yield_Sy":["specific_yield_Sy","specific_yield","sy","specific_yield_fraction"],
+        "is_confined":["is_confined","confined","confined_aquifer"],
+        "season":["season"],"year":["year","date_year"],"month":["month","month_num"],
+        "date":["date","datetime","timestamp","observation_date"]
+    }
     lower={str(c).strip().lower():c for c in d.columns}
-    for target,names in aliases.items():
+    for target,names in COLUMN_ALIASES.items():
         if target not in d.columns:
-            found=next((lower.get(n) for n in names if n in lower),None)
+            found=next((lower.get(n.lower()) for n in names if n.lower() in lower),None)
             if found is not None:d[target]=d[found]
-    if "well_id" not in d.columns:d["well_id"]= [f"CB_{i:05d}" for i in range(1,len(d)+1)]
-    for c,default in [("dem_m",np.nan),("distance_coast_m",np.nan),("geology","Unknown"),("season","Unknown"),("year",2025),("month",1)]:
+
+    if "well_id" not in d.columns:d["well_id"]=[f"CB_{i:05d}" for i in range(1,len(d)+1)]
+    for c,default in [
+        ("dem_m",np.nan),("distance_coast_m",np.nan),("geology_formation","Unknown"),
+        ("depth_to_basement_m",np.nan),("aquifer_thickness_m",np.nan),
+        ("clay_layer_total_m",np.nan),("hydraulic_conductivity_K",np.nan),
+        ("specific_yield_Sy",np.nan),("is_confined",np.nan),
+        ("season","Unknown"),("year",2025),("month",1)
+    ]:
         if c not in d.columns:d[c]=default
-    for c in ["longitude","latitude","groundwater_level_mAHD","dem_m","distance_coast_m","year","month"]:
+
+    numeric_cols=[
+        "longitude","latitude","groundwater_level_mAHD","dem_m","distance_coast_m",
+        "depth_to_basement_m","aquifer_thickness_m","clay_layer_total_m",
+        "hydraulic_conductivity_K","specific_yield_Sy","is_confined","year","month"
+    ]
+    for c in numeric_cols:
         if c in d:d[c]=pd.to_numeric(d[c],errors="coerce")
+    if "is_confined" in d.columns:
+        d["is_confined"]=d["is_confined"].where(d["is_confined"].isna(),d["is_confined"].round().clip(0,1)).astype("Int64")
+
     d=d.dropna(subset=["longitude","latitude","groundwater_level_mAHD"]).reset_index(drop=True)
-    d["geology"]=d["geology"].fillna("Unknown").astype(str)
+    d["geology_formation"]=d["geology_formation"].fillna("Unknown").astype(str)
     if "date" in d.columns:
         d["date"]=pd.to_datetime(d["date"],errors="coerce")
-        # A supplied timestamp is the most precise temporal source for uploaded data.
         d.loc[d["date"].notna(),"year"]=d.loc[d["date"].notna(),"date"].dt.year
         d.loc[d["date"].notna(),"month"]=d.loc[d["date"].notna(),"date"].dt.month
     d["month"]=pd.to_numeric(d["month"],errors="coerce").fillna(1).clip(1,12).astype(int)
@@ -362,13 +528,145 @@ def normalise_columns(df):
     d=d.sort_values(["well_id","date"]).reset_index(drop=True)
     if len(d):
         origin=d["date"].min()
-        d["time_index"]=((d["date"].dt.year-origin.year)*12 + d["date"].dt.month-origin.month).astype(int)
-    else: d["time_index"]=pd.Series(dtype=int)
+        d["time_index"]=((d["date"].dt.year-origin.year)*12+d["date"].dt.month-origin.month).astype(int)
+    else:d["time_index"]=pd.Series(dtype=int)
     d["month_sin"]=np.sin(2*np.pi*(d["month"]-1)/12)
     d["month_cos"]=np.cos(2*np.pi*(d["month"]-1)/12)
     return d
 
-FEATURE_CANDIDATES=["longitude","latitude","dem_m","distance_coast_m","geology_factor","ndvi_mean","ndvi_anomaly","rainfall_mm","et_mm","surface_water_distance_m","distance_lake_wangary_m","pressure_hpa","year","month","time_index","month_sin","month_cos"]
+
+FEATURE_CANDIDATES=[
+    "longitude","latitude","dem_m","distance_coast_m","geology_factor",
+    "depth_to_basement_m","aquifer_thickness_m","clay_layer_total_m",
+    "hydraulic_conductivity_K","specific_yield_Sy","is_confined",
+    "ndvi_mean","ndvi_anomaly","rainfall_mm","et_mm","surface_water_distance_m",
+    "distance_lake_wangary_m","pressure_hpa","year","month","time_index","month_sin","month_cos"
+]
+
+
+SUBSURFACE_COLUMNS=[
+    "depth_to_basement_m","aquifer_thickness_m","clay_layer_total_m",
+    "hydraulic_conductivity_K","specific_yield_Sy","is_confined"
+]
+
+
+def _project_lonlat_to_local_m(x, y):
+    """Convert longitude/latitude to a local metric approximation around the dataset."""
+    lon0=float(np.nanmean(x)); lat0=float(np.nanmean(y))
+    x_m=(np.asarray(x,dtype=float)-lon0)*111320.0*np.cos(np.deg2rad(lat0))
+    y_m=(np.asarray(y,dtype=float)-lat0)*110540.0
+    return x_m,y_m
+
+
+def interpolate_subsurface(known_boreholes, target_wells, value_columns=None,
+                           search_radius_m=5000.0, min_points=5, max_local_points=30):
+    """
+    Interpolate static subsurface properties from REAL bore-log wells only.
+
+    known_boreholes must contain only wells with genuine bore-log measurements.
+    target_wells is the full unique well grid to which the static properties are
+    attached. No temporal columns are used here.
+
+    Each `{column}_source` is one of: observed, interpolated, insufficient_data.
+    A target with < min_points known values inside search_radius_m is never
+    extrapolated.
+    """
+    value_columns=list(value_columns or SUBSURFACE_COLUMNS)
+    required=["well_id","longitude","latitude"]
+    missing=[c for c in required if c not in known_boreholes.columns or c not in target_wells.columns]
+    if missing: raise ValueError(f"Subsurface interpolation requires columns: {missing}")
+    if not (PYKRIGE_OK or SCIPY_OK):
+        raise ImportError("Neither pykrige nor scipy is available for subsurface interpolation.")
+
+    known=known_boreholes.copy()
+    targets=target_wells[["well_id","longitude","latitude"]].drop_duplicates("well_id").copy()
+
+    # Collapse repeated temporal records to one static value per borehole.
+    for c in value_columns:
+        if c not in known.columns: known[c]=np.nan
+        known[c]=pd.to_numeric(known[c],errors="coerce")
+    known["longitude"]=pd.to_numeric(known["longitude"],errors="coerce")
+    known["latitude"]=pd.to_numeric(known["latitude"],errors="coerce")
+    known=known.dropna(subset=["well_id","longitude","latitude"])
+    known=known.groupby("well_id",as_index=False).first()
+
+    out=targets.copy()
+    kx,ky=_project_lonlat_to_local_m(known["longitude"].to_numpy(),known["latitude"].to_numpy())
+    tx,ty=_project_lonlat_to_local_m(out["longitude"].to_numpy(),out["latitude"].to_numpy())
+
+    # A well is considered observed independently for each property.
+    for col in value_columns:
+        out[col]=np.nan
+        out[f"{col}_source"]="insufficient_data"
+        valid=known[col].notna().to_numpy()
+        if not valid.any():
+            continue
+        vx,vy=kx[valid],ky[valid]
+        vv=known.loc[valid,col].to_numpy(float)
+        vwell=known.loc[valid,"well_id"].astype(str).to_numpy()
+
+        for i,(wid,x0,y0) in enumerate(zip(out["well_id"].astype(str),tx,ty)):
+            same=np.where(vwell==wid)[0]
+            if len(same):
+                out.at[i,col]=float(vv[same[0]])
+                out.at[i,f"{col}_source"]="observed"
+                continue
+
+            dist=np.hypot(vx-x0,vy-y0)
+            local_idx=np.flatnonzero(dist<=float(search_radius_m))
+            if len(local_idx)<int(min_points):
+                out.at[i,f"{col}_source"]="insufficient_data"
+                continue
+            if len(local_idx)>int(max_local_points):
+                local_idx=local_idx[np.argsort(dist[local_idx])[:int(max_local_points)]]
+
+            try:
+                if PYKRIGE_OK:
+                    ok=OrdinaryKriging(
+                        vx[local_idx],vy[local_idx],vv[local_idx],
+                        variogram_model="linear",verbose=False,enable_plotting=False
+                    )
+                    pred,_=ok.execute("points",np.array([x0]),np.array([y0]))
+                    value=float(np.asarray(pred).ravel()[0])
+                else:
+                    rbf=Rbf(vx[local_idx],vy[local_idx],vv[local_idx],
+                            function="linear",smooth=0.0)
+                    value=float(rbf(x0,y0))
+                if np.isfinite(value):
+                    out.at[i,col]=value
+                    out.at[i,f"{col}_source"]="interpolated"
+            except Exception:
+                out.at[i,f"{col}_source"]="insufficient_data"
+
+    return out
+
+
+def merge_subsurface_features(data, known_boreholes=None, search_radius_m=5000.0):
+    """
+    Merge one static subsurface record per well into the temporal groundwater data.
+    Only `known_boreholes` is used as an interpolation source; synthetic/demo rows
+    are never used as kriging inputs.
+    """
+    d=data.copy()
+    for c in SUBSURFACE_COLUMNS:
+        if c not in d.columns:d[c]=np.nan
+
+    if known_boreholes is None or known_boreholes.empty:
+        for c in SUBSURFACE_COLUMNS:
+            d[f"{c}_source"]=np.where(d[c].notna(),"observed","insufficient_data")
+        return d
+
+    target_wells=d[["well_id","longitude","latitude"]].drop_duplicates("well_id")
+    sub=interpolate_subsurface(
+        known_boreholes=known_boreholes,
+        target_wells=target_wells,
+        value_columns=SUBSURFACE_COLUMNS,
+        search_radius_m=search_radius_m
+    )
+    source_cols=["well_id"]+[c for c in sub.columns if c in SUBSURFACE_COLUMNS or c.endswith("_source")]
+    return d.drop(columns=[c for c in source_cols if c != "well_id" and c in d.columns]).merge(
+        sub[source_cols],on="well_id",how="left",validate="many_to_one"
+    )
 
 
 def prepare_features(data):
@@ -513,6 +811,84 @@ def refresh_synthetic_target(data):
     return d
 
 
+
+def calculate_sgd(df_predictions, grid_cell_width_m=50):
+    """
+    Calculate coastal submarine groundwater discharge (SGD) using Darcy's Law.
+
+    Uses the app's authoritative ML prediction column, ``active_prediction_mAHD``,
+    together with static/interpolated aquifer thickness and hydraulic conductivity.
+    Only coastal wells/cells within 1 km of the DEA coastline are included.
+
+    Missing subsurface properties are retained as NaN rather than being converted
+    to zero. The returned total therefore sums only calculable coastal cells.
+    """
+    required=[
+        "active_prediction_mAHD",
+        "distance_coast_m",
+        "aquifer_thickness_m",
+        "hydraulic_conductivity_K",
+    ]
+    missing_cols=[c for c in required if c not in df_predictions.columns]
+    if missing_cols:
+        raise ValueError(
+            "SGD calculation requires columns that are missing: "
+            + ", ".join(missing_cols)
+        )
+
+    coastal_df=df_predictions.copy()
+    coastal_df["distance_coast_m"]=pd.to_numeric(
+        coastal_df["distance_coast_m"],errors="coerce"
+    )
+    coastal_df=coastal_df[
+        coastal_df["distance_coast_m"].notna()
+        & (coastal_df["distance_coast_m"] <= 1000)
+    ].copy()
+
+    for c in [
+        "active_prediction_mAHD",
+        "aquifer_thickness_m",
+        "hydraulic_conductivity_K",
+    ]:
+        coastal_df[c]=pd.to_numeric(coastal_df[c],errors="coerce")
+
+    missing_mask=coastal_df[[
+        "aquifer_thickness_m", "hydraulic_conductivity_K"
+    ]].isna().any(axis=1)
+    missing=int(missing_mask.sum())
+    if missing > 0:
+        message=(
+            f"Warning: {missing} coastal wells missing subsurface data — "
+            "SGD will be NaN for these, not zero."
+        )
+        print(message)
+        try:
+            st.warning(message)
+        except Exception:
+            pass
+
+    # Avoid a zero-distance division while preserving the supplied Darcy-law
+    # formulation. A minimum 1 m denominator prevents numerical blow-up at the
+    # coastline; this does not fill missing predictions or subsurface data.
+    coastal_df["hydraulic_gradient"]=(
+        coastal_df["active_prediction_mAHD"]
+        / coastal_df["distance_coast_m"].clip(lower=1)
+    )
+
+    coastal_df["cross_section_area_m2"]=(
+        coastal_df["aquifer_thickness_m"] * float(grid_cell_width_m)
+    )
+
+    coastal_df["SGD_m3_per_day"]=(
+        coastal_df["hydraulic_conductivity_K"]
+        * coastal_df["cross_section_area_m2"]
+        * coastal_df["hydraulic_gradient"]
+    )
+
+    total_coastal_sgd=float(coastal_df["SGD_m3_per_day"].sum(skipna=True))
+    return coastal_df, total_coastal_sgd
+
+
 def grid_surface(df,col,grid_n=34):
     """Create a cell-based IDW surface for a solid geographic map overlay."""
     q=df[["longitude","latitude",col]].dropna().copy()
@@ -564,6 +940,74 @@ def teal_template(fig):
     fig.update_xaxes(showgrid=True,gridcolor="#e7f0ee"); fig.update_yaxes(showgrid=True,gridcolor="#e7f0ee"); return fig
 
 
+def render_sgd_heatmap(coastal_df, total_sgd):
+    """Render coastal submarine groundwater discharge hotspots on a MapLibre map."""
+    st.subheader("Coastal Submarine Groundwater Discharge (SGD) Hotspots")
+
+    if coastal_df is None or coastal_df.empty:
+        st.info("No coastal cells/wells within 1,000 m of the coastline have calculable SGD values.")
+        return
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.metric("Total Estimated Coastal SGD Discharge", f"{total_sgd:,.2f} m³/day")
+    with col2:
+        max_flux = pd.to_numeric(coastal_df["SGD_m3_per_day"], errors="coerce").max()
+        st.metric("Peak Discharge Hotspot Rate", f"{max_flux:,.2f} m³/day/cell" if pd.notna(max_flux) else "—")
+
+    plot_df = coastal_df.dropna(subset=["latitude", "longitude", "SGD_m3_per_day"]).copy()
+    if plot_df.empty:
+        st.warning("Coastal SGD was calculated, but there are no finite values available to map.")
+        return
+
+    color_scale=[[0,"#075a67"],[.48,"#37b9ae"],[1,"#d3b355"]]
+    hover_data={
+        "latitude": False, "longitude": False,
+        "active_prediction_mAHD": ":.2f",
+        "aquifer_thickness_m": ":.1f",
+        "hydraulic_gradient": ":.4f",
+        "SGD_m3_per_day": ":.2f",
+    }
+
+    # Plotly >=5.24 provides the forward-compatible MapLibre density_map trace.
+    # Fall back only when the installed Plotly version does not expose it.
+    try:
+        fig = px.density_map(
+            plot_df, lat="latitude", lon="longitude", z="SGD_m3_per_day",
+            radius=18, center=dict(lat=-34.62, lon=135.47), zoom=11,
+            map_style="open-street-map",
+            color_continuous_scale=color_scale,
+            labels={"SGD_m3_per_day": "Discharge Flux (m³/day)"},
+            hover_data=hover_data,
+        )
+    except (AttributeError, TypeError):
+        # Compatibility fallback for older Plotly installations.
+        fig = px.density_mapbox(
+            plot_df, lat="latitude", lon="longitude", z="SGD_m3_per_day",
+            radius=18, center=dict(lat=-34.62, lon=135.47), zoom=11,
+            mapbox_style="open-street-map",
+            color_continuous_scale=color_scale,
+            labels={"SGD_m3_per_day": "Discharge Flux (m³/day)"},
+            hover_data=hover_data,
+        )
+
+    fig.update_layout(margin={"r":0,"t":40,"l":0,"b":0})
+    st.plotly_chart(teal_template(fig), use_container_width=True)
+
+    if st.session_state.dataset == "Use demo data":
+        st.info(
+            "This is a synthetic-data prototype unless running on uploaded/live observations — "
+            "do not present SGD figures from demo data as real Coffin Bay discharge estimates.",
+            icon="⚠️"
+        )
+    else:
+        st.info(
+            "SGD is estimated from the active ML hydraulic-head prediction and the available "
+            "observed/interpolated subsurface properties. Treat these values as model-derived estimates, not direct discharge measurements.",
+            icon="ℹ️"
+        )
+
+
 def add_boundary_trace(fig):
     if BOUNDARY is None:return
     for geom in BOUNDARY.geometry:
@@ -585,7 +1029,7 @@ def add_coastline_trace(fig, coastline_gdf):
 def make_map(df,value_col,title,height=710,center=None,zoom=9.2,show_anchors=True,coastline_gdf=None,show_coastline=True):
     if df.empty:return go.Figure()
     center=center or {"lat":float(df.latitude.median()),"lon":float(df.longitude.median())}
-    hover_cols=[c for c in ["dem_m","geology","distance_coast_m","distance_lake_wangary_m","groundwater_level_mAHD",value_col,"year","season"] if c in df.columns]
+    hover_cols=[c for c in ["dem_m","geology_formation","distance_coast_m","distance_lake_wangary_m","groundwater_level_mAHD",value_col,"year","season"] if c in df.columns]
     if hasattr(px,"scatter_map"):
         fig=px.scatter_map(df,lat="latitude",lon="longitude",color=value_col,hover_name="well_id",hover_data=hover_cols,color_continuous_scale=[[0,"#075a67"],[.48,"#37b9ae"],[1,"#d3b355"]],zoom=zoom,height=height,center=center,opacity=.90,size_max=11)
         fig.update_layout(map_style="open-street-map")
@@ -654,11 +1098,53 @@ def load_well_points_upload(uploaded_file):
     except Exception as exc:
         return None,f"Well-point layer could not be read: {exc}"
 
+def normalise_subsurface_input(df):
+    """Normalise a bore-log-only table without requiring groundwater observations."""
+    d=df.copy()
+    aliases={
+        "well_id":["well_id","well","site","id","bore_id"],
+        "longitude":["longitude","lon","x_lon"],"latitude":["latitude","lat","y_lat"],
+        "depth_to_basement_m":["depth_to_basement_m","basement_depth_m","depth_basement_m"],
+        "aquifer_thickness_m":["aquifer_thickness_m","aquifer_thickness","aquifer_thick_m"],
+        "clay_layer_total_m":["clay_layer_total_m","total_clay_m","clay_thickness_m"],
+        "hydraulic_conductivity_K":["hydraulic_conductivity_K","hydraulic_conductivity","k","conductivity_K"],
+        "specific_yield_Sy":["specific_yield_Sy","specific_yield","sy","specific_yield_fraction"],
+        "is_confined":["is_confined","confined","confined_aquifer"],
+    }
+    lower={str(c).strip().lower():c for c in d.columns}
+    for target,names in aliases.items():
+        if target not in d.columns:
+            found=next((lower.get(n.lower()) for n in names if n.lower() in lower),None)
+            if found is not None:d[target]=d[found]
+    for c in ["longitude","latitude"]+SUBSURFACE_COLUMNS:
+        if c not in d.columns:d[c]=np.nan
+        d[c]=pd.to_numeric(d[c],errors="coerce")
+    if "is_confined" in d:
+        d["is_confined"]=d["is_confined"].where(d["is_confined"].isna(),d["is_confined"].round().clip(0,1))
+    d["well_id"]=d.get("well_id",pd.Series([f"BORE_{i:05d}" for i in range(1,len(d)+1)],index=d.index))
+    return d.dropna(subset=["well_id","longitude","latitude"]).copy()
+
+def sheet_url_to_csv(share_url):
+    """Convert a Google Sheets share URL to its CSV export URL."""
+    if not share_url or not isinstance(share_url, str):
+        return None
+    match=re.search(r"/d/([a-zA-Z0-9-_]+)",share_url)
+    if not match:
+        return None
+    sheet_id=match.group(1)
+    gid_match=re.search(r"[#?&]gid=(\d+)",share_url)
+    gid=gid_match.group(1) if gid_match else "0"
+    return f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
+
+
 # ============================================================
 # STATE / SIDEBAR
 # ============================================================
 if "dataset" not in st.session_state: st.session_state.dataset="Use demo data"
 if "uploaded_df" not in st.session_state: st.session_state.uploaded_df=None
+if "live_sheet_df" not in st.session_state: st.session_state.live_sheet_df=None
+if "live_sheet_url" not in st.session_state: st.session_state.live_sheet_url=""
+if "uploaded_borelog_df" not in st.session_state: st.session_state.uploaded_borelog_df=None
 if "active_model" not in st.session_state: st.session_state.active_model=None
 if "models_loaded" not in st.session_state: st.session_state.models_loaded=False
 if "coastline" not in st.session_state: st.session_state.coastline=None
@@ -672,19 +1158,62 @@ if "spatial_selection_ids" not in st.session_state: st.session_state.spatial_sel
 with st.sidebar:
     st.markdown("# CB / HYDRO")
     st.caption("Coffin Bay physical-geography intelligence workspace")
-    view=st.radio("Workspace",["Overview","Piezometric map","Model lab","Model drivers","Well explorer","Diagnostics","Scenario lab","Data & export"],label_visibility="collapsed")
+    view=st.radio("Workspace",["Overview","Piezometric map","SGD hotspots","Model lab","Model drivers","Well explorer","Diagnostics","Scenario lab","Data & export"],label_visibility="collapsed")
     st.markdown("### Data source")
-    mode=st.radio("Source",["Upload CSV","Use demo data"],index=0 if st.session_state.dataset=="Upload CSV" else 1)
+    source_options=["Upload CSV","Use demo data","Live Google Sheet Sync"]
+    current_index=source_options.index(st.session_state.dataset) if st.session_state.dataset in source_options else 1
+    mode=st.radio("Source",source_options,index=current_index)
     if mode=="Upload CSV":
         up=st.file_uploader("Upload well observations",type=["csv"],help="CSV should contain longitude, latitude and groundwater level; year/well_id are recommended for temporal modelling.")
         if up is not None:
             try:
                 incoming=normalise_columns(pd.read_csv(up))
+                incoming=apply_dem_open_meteo_fallback(incoming)
                 st.session_state.uploaded_df=incoming
                 st.session_state.dataset="Upload CSV"
                 st.session_state.models_loaded=False
                 st.session_state.active_model=None
             except Exception as exc: st.error(f"CSV could not be read: {exc}")
+        borelog_up=st.file_uploader(
+            "Upload bore-log / subsurface CSV (optional)",
+            type=["csv"],
+            help="Use only genuine bore-log measurements. Required: well_id, longitude, latitude and any of the six static subsurface fields."
+        )
+        if borelog_up is not None:
+            try:
+                bore=normalise_subsurface_input(pd.read_csv(borelog_up))
+                st.session_state.uploaded_borelog_df=bore
+                st.session_state.models_loaded=False
+                st.session_state.active_model=None
+                st.caption(f"Loaded {len(bore):,} bore-log rows; only these rows can seed subsurface interpolation.")
+            except Exception as exc: st.error(f"Bore-log CSV could not be read: {exc}")
+    elif mode=="Live Google Sheet Sync":
+        sheet_url=st.text_input(
+            "Google Sheets share link",
+            value=st.session_state.get("live_sheet_url", ""),
+            help="Open your sheet → Share → 'Anyone with the link' → Viewer. Paste the full share URL here."
+        )
+        st.session_state.live_sheet_url=sheet_url
+        if sheet_url:
+            csv_url=sheet_url_to_csv(sheet_url)
+            if csv_url is None:
+                st.error("Couldn't parse that as a Google Sheets link. Check it's a full share URL.")
+                st.session_state.live_sheet_df=None
+            else:
+                try:
+                    incoming=normalise_columns(pd.read_csv(csv_url))
+                    incoming=apply_dem_open_meteo_fallback(incoming)
+                    if incoming.empty:
+                        raise ValueError("The sheet contains no data rows.")
+                    st.success(f"Live sheet connected — {len(incoming)} rows loaded.")
+                    st.session_state.live_sheet_df=incoming
+                    st.session_state.models_loaded=False
+                    st.session_state.active_model=None
+                except Exception as e:
+                    st.session_state.live_sheet_df=None
+                    st.error(f"Could not read that sheet as CSV — confirm sharing is set to 'Anyone with the link can view'. ({e})")
+        else:
+            st.info("Paste a Google Sheets share link to load the live dataset.")
     else:
         st.session_state.dataset="Use demo data"
         st.markdown("### Synthetic training dataset")
@@ -700,6 +1229,7 @@ with st.sidebar:
         st.session_state.well_points_filename=getattr(wp_upload,"name","")
         st.session_state.models_loaded=False
         st.session_state.active_model=None
+    st.session_state.dataset=mode
     if st.session_state.uploaded_well_points is not None:
         st.caption(st.session_state.well_points_status)
         if len(st.session_state.uploaded_well_points) != 1200:
@@ -708,12 +1238,21 @@ with st.sidebar:
 well_points = st.session_state.uploaded_well_points if st.session_state.dataset=="Use demo data" else None
 if st.session_state.dataset=="Upload CSV" and st.session_state.uploaded_df is None:
     st.markdown('<div class="hero"><div class="hero-title">CB / Groundwater Intelligence</div><div class="hero-sub">Upload the groundwater observation CSV to activate the analysis workspace.</div><span class="chip">DATA · WAITING FOR UPLOAD</span></div>',unsafe_allow_html=True)
-    st.info("No groundwater observations are loaded yet. Use the sidebar upload control, or switch the data source to Use demo data.")
+    st.info("No groundwater observations are loaded yet. Use the sidebar upload control, or switch the data source to another source.")
     st.stop()
-if st.session_state.dataset=="Upload CSV":
-    # Uploaded observations always remain authoritative; synthetic horizon controls
-    # are only used in the demo-data mode.
-    base=st.session_state.uploaded_df
+if st.session_state.dataset=="Live Google Sheet Sync" and st.session_state.live_sheet_df is None:
+    st.markdown('<div class="hero"><div class="hero-title">CB / Groundwater Intelligence</div><div class="hero-sub">Connect a public Google Sheet to activate the analysis workspace.</div><span class="chip">DATA · WAITING FOR GOOGLE SHEET</span></div>',unsafe_allow_html=True)
+    st.info("No live Google Sheet dataset is loaded yet. Paste a full share link in the sidebar and ensure the sheet is shared as 'Anyone with the link → Viewer'.")
+    st.stop()
+if st.session_state.dataset in ["Upload CSV","Live Google Sheet Sync"]:
+    # Real external observations remain authoritative. Apply the same DEM fallback
+    # used by Upload CSV, filling only missing DEM values and never overwriting supplied values.
+    if st.session_state.dataset=="Upload CSV":
+        base=apply_dem_open_meteo_fallback(st.session_state.uploaded_df)
+        st.session_state.uploaded_df=base
+    else:
+        base=apply_dem_open_meteo_fallback(st.session_state.live_sheet_df)
+        st.session_state.live_sheet_df=base
 else:
     # Always load the complete five-year synthetic monthly time series on startup.
     # 1,200 fixed spatial well locations are repeated through 60 months.
@@ -746,7 +1285,7 @@ with st.sidebar:
     COAST_ANCHOR["level_mAHD"] = float(coastal_anchor)
     st.caption("Datum anchors are used by the conceptual surface preview; validate surveyed levels before scientific use.")
     st.markdown("### Filters")
-    geos=st.multiselect("Geology",sorted(base.geology.dropna().astype(str).unique()),sorted(base.geology.dropna().astype(str).unique()))
+    geos=st.multiselect("Geology",sorted(base.geology_formation.dropna().astype(str).unique()),sorted(base.geology_formation.dropna().astype(str).unique()))
     seasons=st.multiselect("Season",sorted(base.season.dropna().astype(str).unique()),sorted(base.season.dropna().astype(str).unique()))
     yr_numeric=pd.to_numeric(base.year,errors="coerce")
     ymin,ymax=int(yr_numeric.min()),int(yr_numeric.max()); years=st.slider("Observation year",ymin,ymax,(ymin,ymax))
@@ -768,6 +1307,19 @@ if coastline_gdf is not None:
 if st.session_state.dataset=="Use demo data" and coastline_gdf is not None:
     base=refresh_synthetic_target(base)
 
+# Static subsurface structure is merged once per well_id, before model training.
+# In real-data mode, ONLY the dedicated bore-log upload is allowed to seed
+# interpolation; demo/synthetic values are never used as interpolation inputs.
+known_borelogs=st.session_state.get("uploaded_borelog_df")
+if known_borelogs is not None and not known_borelogs.empty:
+    base=merge_subsurface_features(base,known_boreholes=known_borelogs,search_radius_m=5000.0)
+elif st.session_state.dataset=="Use demo data":
+    for c in SUBSURFACE_COLUMNS:
+        if c not in base.columns: base[c]=np.nan
+        base[f"{c}_source"]="synthetic"
+else:
+    base=merge_subsurface_features(base,known_boreholes=None)
+
 if not selected:
     st.warning("Select at least one model. Open Model lab to train and load an active model."); st.stop()
 
@@ -776,7 +1328,7 @@ if not selected:
 # on startup while still allowing real uploaded observations to train the models.
 if "trained_signature" not in st.session_state: st.session_state.trained_signature=None
 trained_sig=st.session_state.get("trained_signature")
-if trained_sig == (st.session_state.dataset, tuple(selected), len(base), int(base["well_id"].nunique())) and st.session_state.get("trained_bundle") is not None:
+if trained_sig == (st.session_state.dataset, tuple(selected), len(base), int(base["well_id"].nunique()), int(len(known_borelogs) if known_borelogs is not None else 0)) and st.session_state.get("trained_bundle") is not None:
     d0,X,y,f,results,preds,imps,models,comparison=st.session_state.trained_bundle
 else:
     d0,X,y,f=prepare_features(base)
@@ -788,12 +1340,19 @@ active=st.session_state.active_model
 
 res=d0.copy()
 for name,p in preds.items(): res[f"{name}_predicted_mAHD"]=p
-res["active_prediction_mAHD"]=res.get(f"{active}_predicted_mAHD",np.nan)
+# Keep one authoritative prediction column for downstream analyses. For the
+# sklearn-style active models, refresh it directly from model.predict(X) so the
+# SGD workflow uses exactly the same prediction convention as the active model.
+model=models.get(active) if active else None
+if active and active != "LSTM" and model is not None:
+    res["active_prediction_mAHD"]=model.predict(X)
+else:
+    res["active_prediction_mAHD"]=res.get(f"{active}_predicted_mAHD",np.nan)
 res["active_residual_m"]=res["groundwater_level_mAHD"]-res["active_prediction_mAHD"]
 res["active_abs_error_m"]=res["active_residual_m"].abs()
-d=res[res.geology.astype(str).isin(geos) & res.season.astype(str).isin(seasons) & res.year.between(years[0],years[1])].copy()
+d=res[res.geology_formation.astype(str).isin(geos) & res.season.astype(str).isin(seasons) & res.year.between(years[0],years[1])].copy()
 
-data_label = "UPLOAD" if st.session_state.dataset=="Upload CSV" else "DEMO"
+data_label = "UPLOAD" if st.session_state.dataset=="Upload CSV" else ("LIVE SHEET" if st.session_state.dataset=="Live Google Sheet Sync" else "DEMO")
 active_label = active.upper().replace(" ", " · ") if active else "NOT LOADED"
 status_chip = f"DATA · {data_label} &nbsp;|&nbsp; ACTIVE MODEL · {active.upper()}" if active else f"DATA · {data_label} &nbsp;|&nbsp; MODEL · NOT LOADED"
 st.markdown(f'<div class="hero"><div class="hero-title">CB / Groundwater Intelligence</div><div class="hero-sub">Physical-geography workspace · Rizin AOI · DEA shoreline distance · surface-water anchors · spatial extraction</div><span class="chip">{status_chip}</span></div>',unsafe_allow_html=True)
@@ -807,7 +1366,8 @@ if view=="Overview":
     if st.session_state.dataset=="Use demo data":
         st.caption(f"Synthetic training series: 1,200 fixed wells × 60 monthly observations · {len(d):,} records · 2021–2025. This is scenario data for modelling demonstrations, not observed groundwater measurements.")
     elif d.well_id.nunique()!=len(d):
-        st.caption(f"Uploaded temporal dataset: {d.well_id.nunique():,} unique wells across {len(d):,} observations.")
+        label="Live Google Sheet" if st.session_state.dataset=="Live Google Sheet Sync" else "Uploaded"
+        st.caption(f"{label} temporal dataset: {d.well_id.nunique():,} unique wells across {len(d):,} observations.")
     if coastline_gdf is not None:
         st.markdown(f'<div class="hydro-good"><b>Distance-to-coast engine:</b> shortest perpendicular distance from each well to the clipped DEA annual shoreline for <b>{st.session_state.get("coast_year")}</b>, calculated in EPSG:28353 metres.</div>',unsafe_allow_html=True)
     else:
@@ -815,7 +1375,7 @@ if view=="Overview":
     st.markdown('<div class="panel panel-accent"><b>Conceptual control points</b><div class="small">The piezometric surface is interpreted relative to two explicit surface-water / datum anchors rather than as an unconstrained black-box prediction.</div><div class="anchor-card">COASTAL BOUNDARY · <b>0.0 m AHD</b> — near-coast hydraulic datum</div><div class="anchor-card">LAKE WANGARY · <b>3.0 m AHD</b> — selected surface-water level anchor</div></div>',unsafe_allow_html=True)
     st.markdown('<div class="section">Hydrogeographic response</div>',unsafe_allow_html=True)
     if active:
-        fig=px.scatter(d,x="dem_m",y="groundwater_level_mAHD",color="active_prediction_mAHD",hover_name="well_id",hover_data=["geology","distance_coast_m","year","season"],color_continuous_scale=[[0,"#075a67"],[.48,"#37b9ae"],[1,"#d3b355"]],labels={"dem_m":"DEM elevation (m)","groundwater_level_mAHD":"Observed groundwater (m AHD)","active_prediction_mAHD":f"{active} prediction (m AHD)"})
+        fig=px.scatter(d,x="dem_m",y="groundwater_level_mAHD",color="active_prediction_mAHD",hover_name="well_id",hover_data=["geology_formation","distance_coast_m","year","season"],color_continuous_scale=[[0,"#075a67"],[.48,"#37b9ae"],[1,"#d3b355"]],labels={"dem_m":"DEM elevation (m)","groundwater_level_mAHD":"Observed groundwater (m AHD)","active_prediction_mAHD":f"{active} prediction (m AHD)"})
         st.plotly_chart(teal_template(fig),use_container_width=True)
         st.plotly_chart(make_map(d,"active_prediction_mAHD",f"{active} · spatial prediction layer",coastline_gdf=coastline_gdf,show_coastline=show_coastline),use_container_width=True)
     else:
@@ -856,6 +1416,42 @@ elif view=="Piezometric map":
         b.download_button("Export selected wells · CSV",selected_rows.to_csv(index=False).encode(),"coffin_bay_selected_wells.csv","text/csv",use_container_width=True); st.dataframe(selected_rows,use_container_width=True,hide_index=True)
     else: st.caption("No spatial selection yet. Use Lasso, Box or Point above the map.")
 
+elif view=="SGD hotspots":
+    st.markdown('<div class="section">Coastal submarine groundwater discharge</div>',unsafe_allow_html=True)
+    if not active:
+        st.info("Load an active model from Model Lab first. SGD requires ML-predicted hydraulic heads.")
+        st.stop()
+
+    st.markdown(
+        '<div class="hydro-note"><b>Darcy-law SGD estimate:</b> coastal cells within 1 km of the DEA coastline are evaluated using the active ML-predicted hydraulic head, aquifer thickness, and hydraulic conductivity.</div>',
+        unsafe_allow_html=True
+    )
+    sgd_width=st.number_input(
+        "Grid-cell width (m)", min_value=1.0, value=50.0, step=5.0,
+        help="Cross-shore cell width used to convert aquifer thickness into cross-sectional area."
+    )
+    df_predictions=res.copy()
+    df_predictions["active_prediction_mAHD"]=res["active_prediction_mAHD"]
+    try:
+        coastal_df,total_sgd=calculate_sgd(df_predictions,grid_cell_width_m=sgd_width)
+        render_sgd_heatmap(coastal_df,total_sgd)
+        missing_flux=int(coastal_df["SGD_m3_per_day"].isna().sum()) if not coastal_df.empty else 0
+        if missing_flux:
+            st.warning(f"{missing_flux:,} coastal wells have NaN SGD because required subsurface inputs or predictions are missing.")
+        if not coastal_df.empty:
+            st.dataframe(
+                coastal_df[[c for c in [
+                    "well_id","latitude","longitude","distance_coast_m",
+                    "active_prediction_mAHD","aquifer_thickness_m",
+                    "hydraulic_conductivity_K","hydraulic_gradient",
+                    "cross_section_area_m2","SGD_m3_per_day",
+                    "aquifer_thickness_m_source","hydraulic_conductivity_K_source"
+                ] if c in coastal_df.columns]],
+                use_container_width=True, hide_index=True
+            )
+    except ValueError as exc:
+        st.error(f"SGD calculation could not run: {exc}")
+
 elif view=="Model lab":
     st.markdown('<div class="section">Model training & active-model selection</div>',unsafe_allow_html=True)
     st.markdown('<div class="panel panel-accent"><b>Train → compare → load</b><div class="small">Select candidate models, train them on the same holdout structure, compare RMSE / MAE / R², then explicitly load one model as the active prediction layer. All downstream pages follow the active model selected here.</div></div>',unsafe_allow_html=True)
@@ -864,11 +1460,11 @@ elif view=="Model lab":
         with st.spinner("Training models on the current groundwater time series…"):
             bundle=train_models(base,tuple(selected))
         st.session_state.trained_bundle=bundle
-        st.session_state.trained_signature=(st.session_state.dataset, tuple(selected), len(base), int(base["well_id"].nunique()))
+        st.session_state.trained_signature=(st.session_state.dataset, tuple(selected), len(base), int(base["well_id"].nunique()), int(len(known_borelogs) if known_borelogs is not None else 0))
         st.session_state.models_loaded=True
         st.rerun()
     if st.session_state.dataset=="Use demo data":
-        st.info("Demo training set: 1,200 fixed wells × 60 monthly observations (5 years). For a real study, switch to Upload CSV and train on the uploaded observations.")
+        st.info("Demo training set: 1,200 fixed wells × 60 monthly observations (5 years). For a real study, switch to Upload CSV or Live Google Sheet Sync and train on the external observations.")
     c1,c2=st.columns([1.2,1.8])
     with c1:
         st.markdown('#### Active model')
@@ -900,7 +1496,7 @@ elif view=="Model drivers":
     imp=imps.get(active,pd.Series(dtype=float)); imp_df=imp.rename("Importance").reset_index().rename(columns={"index":"Feature"}); st.caption("Feature importance is a predictive diagnostic, not causal evidence.")
     fig=px.bar(imp_df.sort_values("Importance"),x="Importance",y="Feature",orientation="h",title=f"{active} feature importance"); st.plotly_chart(teal_template(fig),use_container_width=True)
     feat=st.selectbox("Inspect predictor",imp_df.Feature.tolist() if not imp_df.empty else f)
-    scatter=px.scatter(res,x=feat,y="active_prediction_mAHD",color="geology",hover_name="well_id",labels={"active_prediction_mAHD":f"{active} predicted groundwater (m AHD)"}); tmp=res[[feat,"active_prediction_mAHD"]].dropna()
+    scatter=px.scatter(res,x=feat,y="active_prediction_mAHD",color="geology_formation",hover_name="well_id",labels={"active_prediction_mAHD":f"{active} predicted groundwater (m AHD)"}); tmp=res[[feat,"active_prediction_mAHD"]].dropna()
     if len(tmp)>2 and tmp[feat].nunique()>1:
         slope,intercept=np.polyfit(tmp[feat].to_numpy(float),tmp["active_prediction_mAHD"].to_numpy(float),1); xl=np.linspace(tmp[feat].min(),tmp[feat].max(),50); scatter.add_trace(go.Scatter(x=xl,y=slope*xl+intercept,mode="lines",name="Linear guide"))
     st.plotly_chart(teal_template(scatter),use_container_width=True)
@@ -912,7 +1508,7 @@ elif view=="Well explorer":
         st.stop()
     w=st.selectbox("Well",d.well_id.astype(str).unique().tolist()); rd=d[d.well_id.astype(str)==w].sort_values("date"); r=rd.iloc[-1]
     a,b,c,e=st.columns(4); a.metric("Observed",f"{r.groundwater_level_mAHD:.2f} m AHD"); b.metric(f"{active} prediction",f"{r.active_prediction_mAHD:.2f} m AHD" if pd.notna(r.active_prediction_mAHD) else "—"); c.metric("Residual",f"{r.active_residual_m:.2f} m" if pd.notna(r.active_residual_m) else "—"); e.metric("DEM",f"{r.dem_m:.2f} m")
-    st.dataframe(rd[["well_id","date","year","month","season","groundwater_level_mAHD","active_prediction_mAHD","active_residual_m","dem_m","distance_coast_m","distance_lake_wangary_m","geology"]],use_container_width=True,hide_index=True)
+    st.dataframe(rd[["well_id","date","year","month","season","groundwater_level_mAHD","active_prediction_mAHD","active_residual_m","dem_m","distance_coast_m","distance_lake_wangary_m","geology_formation"]],use_container_width=True,hide_index=True)
     fig=px.line(rd,x="date",y=["groundwater_level_mAHD","active_prediction_mAHD"],markers=True,title=f"Observed vs {active} prediction — {w}"); st.plotly_chart(teal_template(fig),use_container_width=True)
 
 elif view=="Diagnostics":
@@ -922,7 +1518,7 @@ elif view=="Diagnostics":
         st.stop()
     fig=px.scatter(res,x="groundwater_level_mAHD",y="active_prediction_mAHD",color="active_abs_error_m",hover_name="well_id",color_continuous_scale=[[0,"#075a67"],[.48,"#37b9ae"],[1,"#d3b355"]],labels={"groundwater_level_mAHD":"Observed (m AHD)","active_prediction_mAHD":f"{active} prediction (m AHD)"})
     lo=min(res.groundwater_level_mAHD.min(),res.active_prediction_mAHD.min()); hi=max(res.groundwater_level_mAHD.max(),res.active_prediction_mAHD.max()); fig.add_shape(type="line",x0=lo,y0=lo,x1=hi,y1=hi,line=dict(dash="dash",color="#557b7f")); st.plotly_chart(teal_template(fig),use_container_width=True)
-    hist=px.histogram(res,x="active_residual_m",nbins=35,title="Residual distribution"); st.plotly_chart(teal_template(hist),use_container_width=True); st.dataframe(res.sort_values("active_abs_error_m",ascending=False)[["well_id","geology","dem_m","distance_coast_m","groundwater_level_mAHD","active_prediction_mAHD","active_residual_m","active_abs_error_m"]].head(80),use_container_width=True,hide_index=True)
+    hist=px.histogram(res,x="active_residual_m",nbins=35,title="Residual distribution"); st.plotly_chart(teal_template(hist),use_container_width=True); st.dataframe(res.sort_values("active_abs_error_m",ascending=False)[["well_id","geology_formation","dem_m","distance_coast_m","groundwater_level_mAHD","active_prediction_mAHD","active_residual_m","active_abs_error_m"]].head(80),use_container_width=True,hide_index=True)
 
 elif view=="Scenario lab":
     st.markdown('<div class="section">Hydrologic scenario lab</div>',unsafe_allow_html=True)
@@ -957,6 +1553,6 @@ else:
 
 st.markdown("---")
 if st.session_state.dataset=="Use demo data":
-    st.caption("Demo synthetic mode · 5 years monthly · 1,200 fixed wells · 72,000 scenario observations. Switch to Upload CSV to train on real/read observations.")
+    st.caption("Demo synthetic mode · 5 years monthly · 1,200 fixed wells · 72,000 scenario observations. Switch to Upload CSV or Live Google Sheet Sync to train on real/read observations.")
 else:
     st.caption(f"Research workspace · Rizin AOI + DEA Coastlines {st.session_state.get('coast_year','—')} + hydrologic anchors + spatial well extraction + RF / GAM / XGBoost / LSTM model comparison on the uploaded dataset.")
